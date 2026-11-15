@@ -165,11 +165,17 @@ function warnIfDestinationIsNot(
   endpoint: string | undefined,
   messageName: string,
   destination: string | null | undefined,
+  strict = false,
 ): void {
   if (endpoint == null) {
     return;
   }
   if (destination == null) {
+    if (strict) {
+      throw new Error(
+        `The signed ${messageName} has no Destination, where \`${endpointOption}\` ("${endpoint}") was expected. SAML bindings require a Destination on a signed message.`,
+      );
+    }
     debugLog(
       'The signed %s has no Destination, where `%s` ("%s") was expected. SAML bindings require one on a signed message, and the next major version rejects it. Configure the identity provider to include the Destination in the messages it signs.',
       messageName,
@@ -177,6 +183,11 @@ function warnIfDestinationIsNot(
       endpoint,
     );
   } else if (!isSameUrl(destination, endpoint)) {
+    if (strict) {
+      throw new Error(
+        `The ${messageName} has the Destination "${destination}", where \`${endpointOption}\` ("${endpoint}") was expected.`,
+      );
+    }
     debugLog(
       'The %s has the Destination "%s", where `%s` ("%s") was expected. The next major version rejects it. If that Destination is the URL of this endpoint, set `%s` to it; otherwise, configure the identity provider to send it to `%s`.',
       messageName,
@@ -196,8 +207,16 @@ function warnIfNoBearerConfirmationNames(
   callbackUrl: string,
   confirmationMethods: string[],
   timelyBearerRecipients: (string | undefined)[],
+  strict = false,
 ): void {
   if (timelyBearerRecipients.length === 0) {
+    if (strict) {
+      throw new Error(
+        `The assertion has no bearer SubjectConfirmation that is valid now; received: ${
+          confirmationMethods.length > 0 ? confirmationMethods.join(", ") : "none"
+        }. A bearer SubjectConfirmation whose Recipient is \`callbackUrl\` ("${callbackUrl}") is required.`,
+      );
+    }
     debugLog(
       'The assertion has no bearer SubjectConfirmation that is valid now; received: %s. The next major version accepts an assertion only through a bearer SubjectConfirmation whose Recipient is `callbackUrl` ("%s"), and rejects this one. Configure the identity provider to send one that is valid when the assertion arrives.',
       confirmationMethods.length > 0 ? confirmationMethods.join(", ") : "none",
@@ -208,6 +227,13 @@ function warnIfNoBearerConfirmationNames(
       (recipient) => recipient != null && isSameUrl(recipient, callbackUrl),
     )
   ) {
+    if (strict) {
+      throw new Error(
+        `No bearer SubjectConfirmationData in the assertion has the Recipient \`callbackUrl\` ("${callbackUrl}"); received: ${timelyBearerRecipients
+          .map((recipient) => recipient ?? "no Recipient")
+          .join(", ")}.`,
+      );
+    }
     debugLog(
       'No bearer SubjectConfirmationData in the assertion has the Recipient `callbackUrl` ("%s"); received: %s. The next major version rejects the assertion. Configure the identity provider to send `callbackUrl` as the Recipient, or, if a Recipient received is the URL of this endpoint, set `callbackUrl` to it.',
       callbackUrl,
@@ -498,6 +524,7 @@ class SAML {
     assertBooleanIfPresent(ctorOptions.wantAuthnResponseSigned);
     assertBooleanIfPresent(ctorOptions.signMetadata);
     assertBooleanIfPresent(ctorOptions.rejectReplayedAssertions);
+    assertBooleanIfPresent(ctorOptions.strict, "`strict` must be a boolean");
     assertValidAttributeConsumingServices(ctorOptions.metadataAttributeConsumingServices);
     if (isValidSamlSigningOptions(ctorOptions)) {
       algorithms.assertDigestAlgorithmChosen(
@@ -519,6 +546,7 @@ class SAML {
       acceptedClockSkewMs: ctorOptions.acceptedClockSkewMs ?? 0,
       maxAssertionAgeMs: ctorOptions.maxAssertionAgeMs ?? 0,
       rejectReplayedAssertions: ctorOptions.rejectReplayedAssertions ?? false,
+      strict: ctorOptions.strict ?? false,
       callbackUrl: ctorOptions.callbackUrl,
       issuer: ctorOptions.issuer,
       audience: ctorOptions.audience ?? ctorOptions.issuer ?? "unknown_audience", // use issuer as default
@@ -592,13 +620,17 @@ class SAML {
     if (isValidSamlSigningOptions(ctorOptions)) {
       for (const option of ["signatureAlgorithm", "digestAlgorithm"] as const) {
         if (ctorOptions[option] === undefined) {
-          algorithms.warnAlgorithmNotSet(option);
+          algorithms.warnAlgorithmNotSet(option, ctorOptions.strict ?? false);
         }
       }
     }
 
     for (const option of ["signatureAlgorithm", "digestAlgorithm"] as const) {
-      algorithms.warnIfAlgorithmNotRecognized(option, ctorOptions[option]);
+      algorithms.warnIfAlgorithmNotRecognized(
+        option,
+        ctorOptions[option],
+        ctorOptions.strict ?? false,
+      );
     }
 
     warnIfContactOrOrganizationInvalid(ctorOptions);
@@ -1229,7 +1261,12 @@ class SAML {
       // Check if this document has a valid top-level signature which applies to the entire XML document
       let validSignature = false; // Use `getVerifiedXml()` to collect the actual verified contents
 
-      const responseVerifiedXml = getVerifiedXml(xml, doc.documentElement, pemFiles);
+      const responseVerifiedXml = getVerifiedXml(
+        xml,
+        doc.documentElement,
+        pemFiles,
+        this.options.strict,
+      );
       let assertionVerifiedXml = null;
       let decryptedAssertionVerifiedXml = null;
 
@@ -1274,7 +1311,7 @@ class SAML {
 
       if (assertions.length == 1) {
         if (this.options.wantAssertionsSigned || !validSignature) {
-          assertionVerifiedXml = getVerifiedXml(xml, assertions[0], pemFiles);
+          assertionVerifiedXml = getVerifiedXml(xml, assertions[0], pemFiles, this.options.strict);
           if (!assertionVerifiedXml) {
             throw new Error("Invalid signature");
           }
@@ -1287,7 +1324,7 @@ class SAML {
         const encryptedAssertionXml = encryptedAssertions[0].toString();
 
         const decryptedXml = await decryptXml(encryptedAssertionXml, this.options.decryptionPvk);
-        warnIfDecryptionWillFailInNextMajor(encryptedAssertions[0]);
+        warnIfDecryptionWillFailInNextMajor(encryptedAssertions[0], this.options.strict);
         const decryptedDoc = await parseDomFromString(decryptedXml);
         const decryptedAssertions = xpath.selectElements(
           decryptedDoc,
@@ -1300,6 +1337,7 @@ class SAML {
             decryptedXml,
             decryptedAssertions[0],
             pemFiles,
+            this.options.strict,
           );
           if (decryptedAssertionVerifiedXml == null) {
             throw new Error("Invalid signature from encrypted assertion");
@@ -1348,6 +1386,7 @@ class SAML {
             this.options.callbackUrl,
             "Response",
             verifiedDestination,
+            this.options.strict,
           );
         }
         return result;
@@ -1383,6 +1422,7 @@ class SAML {
                   this.options.callbackUrl,
                   "Response",
                   verifiedDestination,
+                  this.options.strict,
                 );
                 return { profile: null, loggedOut: false };
               }
@@ -1425,6 +1465,7 @@ class SAML {
             this.options.logoutCallbackUrl,
             "LogoutResponse",
             verifiedDestination,
+            this.options.strict,
           );
           return { profile: null, loggedOut: true };
         } else {
@@ -1554,6 +1595,7 @@ class SAML {
         this.options.logoutCallbackUrl,
         messageName,
         getRootAttribute(dom, "Destination"),
+        this.options.strict,
       );
     }
     return legacy ? result : { ...result, relayState: parameters.relayState };
@@ -1995,6 +2037,7 @@ class SAML {
       this.options.callbackUrl,
       confirmationMethods,
       timelyBearerRecipients,
+      this.options.strict,
     );
     return { profile, loggedOut: false };
   }
@@ -2082,7 +2125,12 @@ class SAML {
     // The document as received locates the signature; only what that signature covers is read.
     const receivedDom = await parseDomFromString(xml);
     const pemFiles = await this.getKeyInfosAsPem();
-    const verifiedXml = getVerifiedXml(xml, receivedDom.documentElement, pemFiles);
+    const verifiedXml = getVerifiedXml(
+      xml,
+      receivedDom.documentElement,
+      pemFiles,
+      this.options.strict,
+    );
     if (verifiedXml == null) {
       throw new Error("Invalid signature on documentElement");
     }
@@ -2094,6 +2142,7 @@ class SAML {
       this.options.logoutCallbackUrl,
       "LogoutRequest",
       getRootAttribute(verifiedDom, "Destination"),
+      this.options.strict,
     );
     return result;
   }
@@ -2123,7 +2172,11 @@ class SAML {
       } else {
         throw new Error("Missing SAML issuer");
       }
-      const nameID = await getNameIdAsync(dom, this.options.decryptionPvk ?? null);
+      const nameID = await getNameIdAsync(
+        dom,
+        this.options.decryptionPvk ?? null,
+        this.options.strict,
+      );
       if (nameID.value) {
         profile.nameID = nameID.value;
         if (nameID.format) {

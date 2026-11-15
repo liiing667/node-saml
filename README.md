@@ -468,10 +468,31 @@ check is accepted. Run with `NODE_DEBUG=node-saml` to be told when one arrives, 
 | `maxAssertionAgeMs`        | `0`     | Reject an assertion older than this, measured from its `IssueInstant`. `0` means no limit beyond `NotOnOrAfter`. When set and stricter than `NotOnOrAfter`, this wins.                |
 | `rejectReplayedAssertions` | `false` | Reject an assertion whose ID has been received before. See [Replayed assertions](#replayed-assertions).                                                                               |
 | `idpIssuer`                | —       | If set, it must match the `Issuer` of the assertion, of logout messages, and of a signed `Response` that has one. For ADFS this looks like `https://acme_tools.windows.net/deadbeef`. |
+| `strict`                   | `false` | Reject, rather than warn about, what the next major version rejects. See [Strict mode](#strict-mode).                                                                                 |
 
 Turning both `wantAssertionsSigned` and `wantAuthnResponseSigned` off does not turn signature
 checking off: either the response or the assertion still has to carry a valid signature, or the
 document is rejected.
+
+### Strict mode
+
+`strict: true` turns the compatibility allowances that this version only warns about (under
+`NODE_DEBUG=node-saml`) into rejections, so a deployment can adopt the next major version's
+behavior today. With it, the library rejects:
+
+- a signed `Response`, `LogoutRequest`, or `LogoutResponse` that has no `Destination`, or one
+  that is not the endpoint it arrived at (`callbackUrl` or `logoutCallbackUrl`);
+- an assertion delivered without a bearer `SubjectConfirmation` that is valid now, or whose
+  `SubjectConfirmationData` `Recipient` is not `callbackUrl`;
+- a signature with other than exactly one reference;
+- a `signatureAlgorithm` or `digestAlgorithm` left unset while `privateKey` is set (which
+  defaults to SHA-1), or set to a value that is not recognized — rejected with a `TypeError`
+  when the `SAML` is constructed;
+- an `EncryptedAssertion` or `EncryptedID` that decrypts with one of the legacy algorithms
+  listed under [`decryptionPvk`](#configuration-option-decryptionpvk).
+
+Each rejection names the element and the reason. The default, `false`, keeps the current
+behavior: the message is accepted and a warning is logged under `NODE_DEBUG=node-saml`.
 
 ### AuthnRequest content
 

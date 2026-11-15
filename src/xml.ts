@@ -100,8 +100,11 @@ const findEncryptedKey = (
     .find((key) => key.getAttribute("Id") === id);
 };
 
-export const warnIfDecryptionWillFailInNextMajor = (encryptedElement: Element): void => {
-  if (!debugLog.enabled) {
+export const warnIfDecryptionWillFailInNextMajor = (
+  encryptedElement: Element,
+  strict = false,
+): void => {
+  if (!strict && !debugLog.enabled) {
     return;
   }
 
@@ -115,6 +118,11 @@ export const warnIfDecryptionWillFailInNextMajor = (encryptedElement: Element): 
 
   const contentAlgorithm = encryptionMethod(encryptedData)?.getAttribute("Algorithm");
   if (contentAlgorithm && deprecatedContentAlgorithms.has(contentAlgorithm)) {
+    if (strict) {
+      throw new Error(
+        `The ${encryptedElement.localName} was decrypted with content encryption algorithm "${contentAlgorithm}", which \`strict\` rejects. Configure the identity provider to encrypt with aes128-gcm or aes256-gcm.`,
+      );
+    }
     debugLog(
       'The %s was decrypted with content encryption algorithm "%s", which the next major version does not decrypt. Configure the identity provider to encrypt with aes128-gcm or aes256-gcm, which this version also decrypts. If it offers neither, and the deployment does not need these contents kept confidential, turn off this encryption at the identity provider: node-saml also accepts the unencrypted form and checks the same signatures either way, but signatures do not hide its contents from the browser or any other system that handles the message.',
       encryptedElement.localName,
@@ -130,6 +138,11 @@ export const warnIfDecryptionWillFailInNextMajor = (encryptedElement: Element): 
   const keyMethod = encryptionMethod(encryptedKey);
   const keyAlgorithm = keyMethod?.getAttribute("Algorithm");
   if (keyAlgorithm === "http://www.w3.org/2001/04/xmlenc#rsa-1_5") {
+    if (strict) {
+      throw new Error(
+        `The ${encryptedElement.localName} was decrypted with key transport algorithm "${keyAlgorithm}", which \`strict\` rejects. Configure the identity provider to wrap the key with rsa-oaep-mgf1p and its default SHA-1 digest.`,
+      );
+    }
     debugLog(
       'The %s was decrypted with key transport algorithm "%s", which the next major version does not decrypt. Configure the identity provider to wrap the key with rsa-oaep-mgf1p and its default SHA-1 digest, which this version also decrypts. If it offers no rsa-oaep-mgf1p, and the deployment does not need these contents kept confidential, turn off this encryption at the identity provider: node-saml also accepts the unencrypted form and checks the same signatures either way, but signatures do not hide its contents from the browser or any other system that handles the message.',
       encryptedElement.localName,
@@ -146,6 +159,11 @@ export const warnIfDecryptionWillFailInNextMajor = (encryptedElement: Element): 
       ?.getAttribute("Algorithm");
 
     if (digestAlgorithm && deprecatedOaepDigests.has(digestAlgorithm)) {
+      if (strict) {
+        throw new Error(
+          `The ${encryptedElement.localName} was decrypted with key transport algorithm "${keyAlgorithm}" and DigestMethod "${digestAlgorithm}", which \`strict\` rejects: that digest is used for OAEP with SHA-1 for MGF1, as XML Encryption 1.1 requires, and this key was wrapped another way. Configure the identity provider to use SHA-1, the default rsa-oaep-mgf1p digest.`,
+        );
+      }
       debugLog(
         'The %s was decrypted with key transport algorithm "%s" and DigestMethod "%s", which the next major version does not decrypt: it uses that digest for OAEP and SHA-1 for MGF1, as XML Encryption 1.1 requires, and this key was wrapped another way. Configure the identity provider to use SHA-1, the default rsa-oaep-mgf1p digest, which both versions decrypt.',
         encryptedElement.localName,
@@ -169,6 +187,7 @@ export const getVerifiedXml = (
   fullXml: string,
   currentNode: Element,
   pemFiles: string[],
+  strict = false,
 ): string | null => {
   // find any signature
   const signatures = xpath.selectElements(
@@ -202,6 +221,11 @@ export const getVerifiedXml = (
     const refs = sig.getReferences();
 
     if (refs.length !== 1) {
+      if (strict) {
+        throw new Error(
+          `The signature on the ${currentNode.localName} element has ${refs.length} references; SAML requires exactly one, to the element signed (SAML core §5.4.2). Configure the identity provider to sign the ${currentNode.localName} with a single reference.`,
+        );
+      }
       debugLog(
         "The signature on the %s element has %d references, so it is ignored and the element is treated as unsigned. SAML requires exactly one, to the element signed (SAML core §5.4.2), and the next major version rejects the message. Configure the identity provider to sign the %s with a single reference.",
         currentNode.localName,
@@ -446,6 +470,7 @@ export const promiseWithNameId = async (nameid: Node): Promise<NameID> => {
 export const getNameIdAsync = async (
   doc: Node,
   decryptionPvk: string | Buffer | null,
+  strict = false,
 ): Promise<NameID> => {
   const nameIds = xpath.selectElements(
     doc,
@@ -479,7 +504,7 @@ export const getNameIdAsync = async (
     const encryptedDataXml = encryptedData[0].toString();
 
     const decryptedXml = await decryptXml(encryptedDataXml, decryptionPvk);
-    warnIfDecryptionWillFailInNextMajor(encryptedIds[0]);
+    warnIfDecryptionWillFailInNextMajor(encryptedIds[0], strict);
     const decryptedDoc = await parseDomFromString(decryptedXml);
     const decryptedIds = xpath.selectElements(decryptedDoc, "/*[local-name()='NameID']");
     if (decryptedIds.length !== 1) {

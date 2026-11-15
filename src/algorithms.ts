@@ -42,7 +42,12 @@ export function assertDigestAlgorithmChosen(
   }
 }
 
-export function warnAlgorithmNotSet(option: AlgorithmOption): void {
+export function warnAlgorithmNotSet(option: AlgorithmOption, strict = false): void {
+  if (strict) {
+    throw new TypeError(
+      `\`${option}\` is required when \`privateKey\` is set and \`strict\` is true: without it the algorithm defaults to sha1, which is no longer considered safe for signatures.`,
+    );
+  }
   debugLog(
     "`%s` is not set, so it defaults to `sha1`, which is no longer considered safe for signatures. The next major version requires it whenever `privateKey` is set; set it now.",
     option,
@@ -54,8 +59,14 @@ export function warnAlgorithmNotSet(option: AlgorithmOption): void {
 export function warnIfAlgorithmNotRecognized(
   option: AlgorithmOption,
   value: string | undefined,
+  strict = false,
 ): void {
   if (value !== undefined && !SUPPORTED_ALGORITHMS[option].includes(value)) {
+    if (strict) {
+      throw new TypeError(
+        `\`${option}\` is set to "${value}", which is not recognized; use one of ${SUPPORTED_ALGORITHMS[option].join(", ")}.`,
+      );
+    }
     debugLog(
       '`%s` is set to "%s", which is not recognized, so SHA-1 is used instead. Use one of %s. The next major version rejects an unrecognized value rather than downgrading.',
       option,

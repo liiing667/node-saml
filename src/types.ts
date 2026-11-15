@@ -327,6 +327,16 @@ export interface SamlOptions extends Partial<SamlSigningOptions>, MandatorySamlO
   wantAuthnResponseSigned: boolean;
   maxAssertionAgeMs: number;
   rejectReplayedAssertions?: boolean;
+  /**
+   * Reject, rather than warn about under `NODE_DEBUG=node-saml`, what this version accepts only
+   * for compatibility and the next major version rejects: a signed message without a
+   * `Destination` that is the endpoint it arrived at, an assertion without a bearer
+   * `SubjectConfirmationData` whose `Recipient` is `callbackUrl`, a signature with other than
+   * one reference, a `signatureAlgorithm` or `digestAlgorithm` left to its SHA-1 default or set
+   * to an unrecognized value, and the decryption algorithms the next major version removes.
+   * Defaults to `false`.
+   */
+  strict?: boolean;
   generateUniqueId: () => string;
   signMetadata: boolean;
 
