@@ -954,6 +954,31 @@ idpCert: (callback) => {
 };
 ```
 
+Each validation freezes the configured `idpIssuer` and one complete certificate set before it
+checks any signature. The set is identified by a stable `metadataGeneration`, and the profiles
+returned by
+`validatePostResponseAsync`, `validatePostRequestAsync`, and `validateRedirectAsync` carry
+`idpTrust`, `metadataGeneration` (also available as `metadataVersion`), `certFingerprints`, the
+actual `certFingerprint`, and `verificationStage`.
+
+A static `idpCert` changes generation when its contents change, even if the option object is mutated
+in place. A failed refresh, such as a callback error or an invalid certificate in a proposed set,
+does not delete the last complete generation: that set remains the trust anchor until a complete new
+set is resolved. This keeps a partially published rotation from either accepting an unpublished
+certificate or making a still-valid old certificate unusable. A dual-certificate window is just a
+complete set containing both certificates; retiring one changes the generation and stops responses
+signed by the retired certificate from validating.
+
+The last complete generation is also recorded through the configured `cacheProvider` under a
+reserved key, so a new `SAML` instance sharing that provider can recover it when a refresh fails
+after a restart. A successful refresh replaces the record atomically from the validator's point of
+view; a failed refresh never overwrites it.
+
+`getIdentityProviderTrustAsync()` resolves and returns the current generation without validating a
+message, and `lastIdpTrust` / `idpCertGeneration` expose the last committed generation. Rejections
+carry the same evidence on their `samlTrust` property (and the same fields directly on the error),
+so a failure report can name the issuer, certificate set, and validation stage that was in force.
+
 Accepted formats:
 
 1. RFC 7468 PEM, as a certificate or a bare public key:

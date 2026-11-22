@@ -74,3 +74,20 @@ export const keyInfoToBase64Certificate = (
 export const generateUniqueId = (): string => {
   return "_" + crypto.randomBytes(20).toString("hex");
 };
+
+/** A stable SHA-256 identity for a normalized certificate or public key. */
+export const certificateFingerprint = (pem: string): string => {
+  try {
+    return new crypto.X509Certificate(pem).fingerprint256;
+  } catch {
+    try {
+      const der = crypto.createPublicKey(pem).export({ type: "spki", format: "der" });
+      return `sha256:${crypto.createHash("sha256").update(der).digest("hex")}`;
+    } catch {
+      return `sha256:${crypto.createHash("sha256").update(pem).digest("hex")}`;
+    }
+  }
+};
+
+/** Alias for `certificateFingerprint`. */
+export const fingerprintPem = certificateFingerprint;

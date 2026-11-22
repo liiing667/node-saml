@@ -93,6 +93,42 @@ export type IdpCertCallback = (
 ) => void;
 
 /**
+ * The point in response validation at which a signature was accepted or rejected.
+ */
+export type SamlValidationStage =
+  | "admission"
+  | "response"
+  | "assertion"
+  | "encrypted-assertion"
+  | "logout-request"
+  | "logout-response";
+
+/**
+ * The complete IdP certificate set used for one validation. `generation` changes only when the
+ * published issuer and certificate set change, and is stable across processes for the same set.
+ */
+export interface IdpTrustSnapshot {
+  generation: string;
+  /** Alias for `generation`. */
+  metadataGeneration?: string;
+  /** Alias for `generation`, for consumers that call the value a metadata version. */
+  metadataVersion?: string;
+  /** Alias for `generation`. */
+  idpCertGeneration?: string;
+  issuer: string | null;
+  certFingerprints: string[];
+}
+
+/**
+ * The trust evidence for a profile or a rejection. `certFingerprint` names the key that actually
+ * verified the message; `certFingerprints` lists the whole accepted set.
+ */
+export interface SamlTrustReport extends IdpTrustSnapshot {
+  certFingerprint: string | null;
+  validationStage: SamlValidationStage;
+}
+
+/**
  * These are SAML options that must be provided to construct a new SAML Strategy
  */
 export interface MandatorySamlOptions {
@@ -439,6 +475,35 @@ export interface Profile {
   ["urn:oid:0.9.2342.19200300.100.1.3"]?: string;
   getAssertionXml?(): string; // get the assertion XML, taken from the verified content
   getAssertion?(): Record<string, unknown>; // get the verified assertion XML parsed as a JavaScript object
+  /**
+   * The complete IdP certificate generation used to authenticate this profile, including the
+   * fingerprint of the certificate that verified the message.
+   */
+  idpTrust?: SamlTrustReport;
+  /**
+   * Stable identity of the IdP certificate set that authenticated this profile.
+   */
+  metadataGeneration?: string;
+  /** Alias for `metadataGeneration`. */
+  idpCertGeneration?: string;
+  /** Alias for `metadataGeneration`, for consumers that call the value a metadata version. */
+  metadataVersion?: string;
+  /** Fingerprint of the certificate that actually verified the message. */
+  certFingerprint?: string | null;
+  /** Alias for `certFingerprint`. */
+  idpCertFingerprint?: string | null;
+  /** Aliases for `certFingerprint`, matching the common X.509 spelling. */
+  certificateFingerprint?: string | null;
+  /** Every certificate fingerprint in the accepted generation. */
+  certFingerprints?: string[];
+  /** Alias for `certFingerprints`. */
+  idpCertFingerprints?: string[];
+  /** Alias for `certFingerprints`, matching the common X.509 spelling. */
+  certificateFingerprints?: string[];
+  /** The signature check that authenticated this profile. */
+  verificationStage?: SamlValidationStage;
+  /** Alias for `verificationStage`. */
+  validationStage?: SamlValidationStage;
   /**
    * Returns the SAML response as received. It may contain material that was not covered by the
    * signature used to authenticate the assertion, and it does not say which part was. Do not

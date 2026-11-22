@@ -280,6 +280,11 @@ function inSchemaOrder(element: XMLValue, children: string[]): XMLValue {
 export const buildServiceProviderMetadata = (
   params: GenerateServiceProviderMetadataParams,
 ): string => {
+  params = {
+    ...params,
+    publicCerts: Array.isArray(params.publicCerts) ? [...params.publicCerts] : params.publicCerts,
+  };
+
   const {
     issuer,
     callbackUrl,
@@ -449,6 +454,11 @@ export const buildServiceProviderMetadata = (
 export const generateServiceProviderMetadata = (
   params: GenerateServiceProviderMetadataParams,
 ): string => {
+  params = {
+    ...params,
+    publicCerts: Array.isArray(params.publicCerts) ? [...params.publicCerts] : params.publicCerts,
+  };
+
   if (params.signMetadata === true && isValidSamlSigningOptions(params)) {
     algorithms.assertDigestAlgorithmChosen(params.signatureAlgorithm, params.digestAlgorithm);
     // An omitted `signatureAlgorithm` needs no notice here: signing fails without one.

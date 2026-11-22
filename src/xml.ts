@@ -169,6 +169,7 @@ export const getVerifiedXml = (
   fullXml: string,
   currentNode: Element,
   pemFiles: string[],
+  verification?: { pemFile?: string },
 ): string | null => {
   // find any signature
   const signatures = xpath.selectElements(
@@ -254,6 +255,9 @@ export const getVerifiedXml = (
         continue; // no signatures verified
       }
 
+      if (verification != null) {
+        verification.pemFile = pemFile;
+      }
       return sig.getSignedReferences()[0];
     } catch {
       // return null; // we don't return null, since we have to verify with another key
@@ -366,19 +370,26 @@ export const signXml = (
   if (!options) throw new Error("options is required");
   if (!isValidSamlSigningOptions(options)) throw new Error("options.privateKey is required");
 
-  const transforms = options.xmlSignatureTransforms ?? defaultTransforms;
+  // Freeze the signing identity before any work begins: a caller that rotates a key while this
+  // call is in progress must not get a signature made from half of each generation.
+  const signingOptions: SamlSigningOptions = {
+    ...options,
+    xmlSignatureTransforms:
+      options.xmlSignatureTransforms == null ? undefined : [...options.xmlSignatureTransforms],
+  };
+  const transforms = signingOptions.xmlSignatureTransforms ?? defaultTransforms;
   const sig = new xmlCrypto.SignedXml();
-  if (options.signatureAlgorithm != null) {
-    sig.signatureAlgorithm = algorithms.getSigningAlgorithm(options.signatureAlgorithm);
+  if (signingOptions.signatureAlgorithm != null) {
+    sig.signatureAlgorithm = algorithms.getSigningAlgorithm(signingOptions.signatureAlgorithm);
   }
   sig.addReference({
     xpath,
     transforms,
-    digestAlgorithm: algorithms.getDigestAlgorithm(options.digestAlgorithm),
+    digestAlgorithm: algorithms.getDigestAlgorithm(signingOptions.digestAlgorithm),
   });
-  sig.privateKey = privateKeyToPem(options.privateKey, "privateKey");
-  if (options.publicCert != null) {
-    const publicCert = keyInfoToPem(options.publicCert, "CERTIFICATE", "publicCert");
+  sig.privateKey = privateKeyToPem(signingOptions.privateKey, "privateKey");
+  if (signingOptions.publicCert != null) {
+    const publicCert = keyInfoToPem(signingOptions.publicCert, "CERTIFICATE", "publicCert");
     // toPem() keeps a PEM's own label, and xml-crypto omits KeyInfo when it finds no certificate.
     assertRequired(
       xmlCrypto.pemCertificates(publicCert).length > 0 || undefined,

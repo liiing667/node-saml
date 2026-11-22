@@ -22,6 +22,7 @@ import {
   AuthorizeRequestXML,
   CacheProvider,
   IdpCertCallback,
+  IdpTrustSnapshot,
   isValidSamlSigningOptions,
   LogoutRequestXML,
   Profile,
@@ -31,6 +32,7 @@ import {
   SamlOptions,
   SamlResponseXmlJs,
   SamlStatusError,
+  SamlValidationStage,
   ValidateInResponseTo,
   XmlJsObject,
   XMLInput,
@@ -38,6 +40,14 @@ import {
   XMLOutput,
   XMLValue,
 } from "./types";
+import {
+  applyTrustReport,
+  attachTrustReport,
+  createTrust,
+  publicTrust,
+  ResolvedIdpTrust,
+  trustReport,
+} from "./trust";
 import { assertBooleanIfPresent, assertRequired } from "./utility";
 import {
   buildXml2JsObject,
@@ -461,6 +471,36 @@ const resolveAndParseKeyInfosToPem = async ({
   }
 };
 
+type TrustOut = { trust?: ResolvedIdpTrust };
+
+// The source key lets a static `idpCert` replace the cached PEM list when its contents change.
+// It hashes the values rather than their names so an array mutated in place is noticed too.
+const idpCertSourceKey = (idpCert: unknown): string => {
+  const hash = crypto.createHash("sha256");
+  const values = Array.isArray(idpCert) ? idpCert : [idpCert];
+  for (const value of values) {
+    if (Buffer.isBuffer(value)) {
+      hash.update("buffer:");
+      hash.update(value);
+    } else if (typeof value === "string") {
+      hash.update("string:");
+      hash.update(value);
+    } else {
+      hash.update("other:");
+      hash.update(String(value));
+    }
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+};
+
+const snapshotSigningOptions = (options: SamlOptions): SamlOptions => ({
+  ...options,
+  idpCert: Array.isArray(options.idpCert) ? [...options.idpCert] : options.idpCert,
+  xmlSignatureTransforms:
+    options.xmlSignatureTransforms == null ? undefined : [...options.xmlSignatureTransforms],
+});
+
 class SAML {
   /**
    * Note that some methods in SAML are not yet marked as protected as they are used in testing.
@@ -472,6 +512,13 @@ class SAML {
 
   // Array of PEM files used to validate signatures.
   pemFiles: string[] = [];
+
+  private currentIdpTrust: ResolvedIdpTrust | null = null;
+  private idpCertSource: string | null = null;
+  private trustResolutionSequence = 0;
+  private trustCommitSequence = 0;
+  private lastPersistedTrustGeneration: string | null = null;
+  private trustPersistenceQueue: Promise<void> = Promise.resolve();
 
   constructor(ctorOptions: SamlConfig) {
     this.options = this.initialize(ctorOptions);
@@ -618,10 +665,13 @@ class SAML {
     return options;
   }
 
-  protected signRequest(samlMessage: querystring.ParsedUrlQueryInput): void {
-    assertRequired(this.options.privateKey, "privateKey is required");
+  protected signRequest(
+    samlMessage: querystring.ParsedUrlQueryInput,
+    options: SamlOptions = this.options,
+  ): void {
+    assertRequired(options.privateKey, "privateKey is required");
 
-    const sigAlg = algorithms.getSigningAlgorithm(this.options.signatureAlgorithm);
+    const sigAlg = algorithms.getSigningAlgorithm(options.signatureAlgorithm);
     samlMessage.SigAlg = sigAlg;
     const signer = algorithms.findSignatureAlgorithm(sigAlg);
     assertRequired(signer, `${sigAlg} is not supported`);
@@ -635,7 +685,7 @@ class SAML {
     }
     samlMessage.Signature = signer.getSignature(
       signedParameters.toString(),
-      privateKeyToPem(this.options.privateKey, "privateKey"),
+      privateKeyToPem(options.privateKey, "privateKey"),
     );
   }
 
@@ -645,6 +695,7 @@ class SAML {
     isHttpPostBinding: boolean,
   ): Promise<string> {
     assertRequired(this.options.entryPoint, "entryPoint is required");
+    const signingOptions = snapshotSigningOptions(this.options);
 
     const id = this.options.generateUniqueId();
     const instant = generateInstant();
@@ -782,8 +833,8 @@ class SAML {
 
     let stringRequest = buildXmlBuilderObject(request, false);
     // TODO: maybe we should always sign here
-    if (isHttpPostBinding && isValidSamlSigningOptions(this.options)) {
-      stringRequest = signAuthnRequestPost(stringRequest, this.options);
+    if (isHttpPostBinding && isValidSamlSigningOptions(signingOptions)) {
+      stringRequest = signAuthnRequestPost(stringRequest, signingOptions);
     }
     return stringRequest;
   }
@@ -880,6 +931,7 @@ class SAML {
     additionalParameters: querystring.ParsedUrlQuery,
   ): Promise<string> {
     assertRequired(this.options.entryPoint, "entryPoint is required");
+    const signingOptions = snapshotSigningOptions(this.options);
     const requestOrResponse = request || response;
     assertRequired(requestOrResponse, "either request or response is required");
 
@@ -917,13 +969,13 @@ class SAML {
       delete samlMessage.RelayState;
       target.searchParams.delete("RelayState");
     }
-    if (isValidSamlSigningOptions(this.options)) {
+    if (isValidSamlSigningOptions(signingOptions)) {
       if (!this.options.entryPoint) {
         throw new Error('"entryPoint" config parameter is required for signed messages');
       }
 
       // sets .SigAlg and .Signature
-      this.signRequest(samlMessage);
+      this.signRequest(samlMessage, signingOptions);
     }
     Object.keys(samlMessage).forEach((k) => {
       target.searchParams.set(k, samlMessage[k] as string);
@@ -1140,18 +1192,183 @@ class SAML {
    * @deprecated Pass a function as `idpCert` instead of overriding this: an override can change
    *   the keys a signature is verified with, so the next major version makes this method private.
    */
-  protected async getKeyInfosAsPem(): Promise<string[]> {
-    if (typeof this.options.idpCert === "function") {
-      // Do not cache
-      return await resolveAndParseKeyInfosToPem(this.options);
-    } else if (this.pemFiles.length > 0) {
-      // Return already cached PEM files.
-      return this.pemFiles;
+  protected async getKeyInfosAsPem(out?: TrustOut): Promise<string[]> {
+    const trust = await this.resolveIdpTrust();
+    if (out != null) {
+      out.trust = trust;
+    }
+    return trust.pemFiles;
+  }
+
+  /**
+   * The IdP certificate generation currently in force. Calling this resolves a configured
+   * `idpCert` callback once, so a rotation can be observed without waiting for a response.
+   */
+  async getIdentityProviderTrustAsync(): Promise<IdpTrustSnapshot> {
+    const out: TrustOut = {};
+    const pemFiles = await this.getKeyInfosAsPem(out);
+    return publicTrust(out.trust ?? createTrust(pemFiles, this.options.idpIssuer ?? null));
+  }
+
+  /** Alias for `getIdentityProviderTrustAsync`. */
+  async getIdpTrustAsync(): Promise<IdpTrustSnapshot> {
+    return this.getIdentityProviderTrustAsync();
+  }
+
+  /** The IdP trust generation last committed by this instance, if any. */
+  get lastIdpTrust(): IdpTrustSnapshot | null {
+    return this.currentIdpTrust == null ? null : publicTrust(this.currentIdpTrust);
+  }
+
+  /** Stable identity of the currently committed IdP certificate set. */
+  get idpCertGeneration(): string | undefined {
+    return this.currentIdpTrust?.generation;
+  }
+
+  private async resolveIdpTrust(): Promise<ResolvedIdpTrust> {
+    const issuer = this.options.idpIssuer ?? null;
+    const idpCert = this.options.idpCert;
+    const isCallback = typeof idpCert === "function";
+    const source = isCallback ? null : idpCertSourceKey(idpCert);
+
+    if (
+      !isCallback &&
+      this.currentIdpTrust != null &&
+      source === this.idpCertSource &&
+      issuer === this.currentIdpTrust.issuer
+    ) {
+      if (this.pemFiles.length > 0) {
+        if (this.pemFiles === this.currentIdpTrust.pemFiles) {
+          return this.currentIdpTrust;
+        }
+        // `pemFiles` has always been a public cache. Preserve a caller that replaces it directly,
+        // as the old `getKeyInfosAsPem` returned that array.
+        this.currentIdpTrust = createTrust(this.pemFiles, issuer);
+        return this.currentIdpTrust;
+      }
     }
 
-    // Load PEM files from different sources and cache.
-    this.pemFiles = await resolveAndParseKeyInfosToPem(this.options);
-    return this.pemFiles;
+    // Resolutions are ordered so an older callback result that finishes last cannot replace a
+    // newer committed generation. Each caller still verifies with the set it was handed.
+    const sequence = ++this.trustResolutionSequence;
+    let trust: ResolvedIdpTrust;
+    try {
+      trust = createTrust(await resolveAndParseKeyInfosToPem(this.options), issuer);
+    } catch (error) {
+      if (this.currentIdpTrust != null) {
+        debugLog(
+          "The IdP certificate set could not be refreshed (%s). Keeping generation %s rather than removing a still-usable certificate or accepting an unpublished one.",
+          (error as Error).message,
+          this.currentIdpTrust.generation,
+        );
+        return this.currentIdpTrust;
+      }
+
+      // A new process has no in-memory generation. Recover the last complete set recorded before
+      // the restart, if the deployment supplied a cache that outlives it.
+      const persisted = await this.loadPersistedIdpTrust();
+      if (persisted != null) {
+        // A concurrent refresh may have committed while the cache was being read; never replace
+        // its generation with an older recovered one.
+        if (this.currentIdpTrust != null) {
+          return this.currentIdpTrust;
+        }
+        this.currentIdpTrust = persisted;
+        this.trustCommitSequence = Math.max(this.trustCommitSequence, sequence);
+        if (!isCallback) {
+          this.pemFiles = persisted.pemFiles;
+          this.idpCertSource = source;
+        }
+        debugLog(
+          "The IdP certificate set could not be refreshed (%s). Recovered generation %s from the cache rather than accepting a partial rotation.",
+          (error as Error).message,
+          persisted.generation,
+        );
+        return persisted;
+      }
+      throw error;
+    }
+
+    if (sequence >= this.trustCommitSequence) {
+      this.trustCommitSequence = sequence;
+      this.currentIdpTrust = trust;
+      if (!isCallback) {
+        // Keep the historical `pemFiles` reference stable while the static source is unchanged.
+        this.pemFiles = trust.pemFiles;
+        this.idpCertSource = source;
+      }
+      await this.persistIdpTrust(trust);
+    }
+    return trust;
+  }
+
+  private idpTrustCacheKey(): string {
+    // The cache provider is documented as belonging to one identity provider. The SP issuer
+    // keeps the key stable when that provider rotates its certificate or metadata issuer.
+    const identity = crypto.createHash("sha256").update(this.options.issuer).digest("hex");
+    return `__node_saml_idp_trust__:${identity}`;
+  }
+
+  private async loadPersistedIdpTrust(): Promise<ResolvedIdpTrust | null> {
+    try {
+      const stored = await this.cacheProvider.getAsync(this.idpTrustCacheKey());
+      if (stored == null) {
+        return null;
+      }
+      const parsed = JSON.parse(stored) as {
+        generation?: unknown;
+        issuer?: unknown;
+        pemFiles?: unknown;
+      };
+      const generation = parsed.generation;
+      const issuer = parsed.issuer;
+      const storedPemFiles = parsed.pemFiles;
+      if (
+        typeof generation !== "string" ||
+        (issuer !== null && typeof issuer !== "string") ||
+        !Array.isArray(storedPemFiles) ||
+        !storedPemFiles.every(
+          (pem: unknown): pem is string => typeof pem === "string" && pem.length > 0,
+        )
+      ) {
+        return null;
+      }
+      const pemFiles = await resolveAndParseKeyInfosToPem({ idpCert: storedPemFiles });
+      const trust = createTrust(pemFiles, issuer);
+      return trust.generation === generation ? trust : null;
+    } catch (error) {
+      debugLog("Ignoring an unreadable persisted IdP certificate generation: %s", error);
+      return null;
+    }
+  }
+
+  private persistIdpTrust(trust: ResolvedIdpTrust): Promise<void> {
+    if (trust.generation === this.lastPersistedTrustGeneration) {
+      return Promise.resolve();
+    }
+    this.trustPersistenceQueue = this.trustPersistenceQueue.then(async () => {
+      // A newer generation may have committed while this write waited its turn.
+      if (this.currentIdpTrust?.generation !== trust.generation) {
+        return;
+      }
+      try {
+        const key = this.idpTrustCacheKey();
+        await this.cacheProvider.removeAsync(key);
+        await this.cacheProvider.saveAsync(
+          key,
+          JSON.stringify({
+            generation: trust.generation,
+            issuer: trust.issuer,
+            pemFiles: trust.pemFiles,
+          }),
+        );
+        this.lastPersistedTrustGeneration = trust.generation;
+      } catch (error) {
+        // A cache that cannot store the generation still validates messages in this process.
+        debugLog("Unable to persist the IdP certificate generation: %s", error);
+      }
+    });
+    return this.trustPersistenceQueue;
   }
 
   // given actually signed XML, try to get the actual assertion used
@@ -1210,6 +1427,9 @@ class SAML {
     let verifiedInResponseTo: string | null = null;
     let verifiedDestination: string | null = null;
     let verifiedAssertionXml: string | null = null;
+    let trust: ResolvedIdpTrust | null = null;
+    let validationStage: SamlValidationStage = "admission";
+    let verifiedPem: string | undefined;
 
     try {
       xml = Buffer.from(container.SAMLResponse, "base64").toString("utf8");
@@ -1225,16 +1445,28 @@ class SAML {
 
         await this.validateInResponseTo(inResponseTo);
       }
-      const pemFiles = await this.getKeyInfosAsPem();
+      const trustOut: TrustOut = {};
+      const pemFiles = await this.getKeyInfosAsPem(trustOut);
+      const validationTrust =
+        trustOut.trust ?? createTrust(pemFiles, this.options.idpIssuer ?? null);
+      trust = validationTrust;
+      validationStage = "response";
       // Check if this document has a valid top-level signature which applies to the entire XML document
       let validSignature = false; // Use `getVerifiedXml()` to collect the actual verified contents
 
-      const responseVerifiedXml = getVerifiedXml(xml, doc.documentElement, pemFiles);
-      let assertionVerifiedXml = null;
-      let decryptedAssertionVerifiedXml = null;
+      const responseVerification: { pemFile?: string } = {};
+      const responseVerifiedXml = getVerifiedXml(
+        xml,
+        doc.documentElement,
+        pemFiles,
+        responseVerification,
+      );
+      let assertionVerifiedXml: string | null = null;
+      let decryptedAssertionVerifiedXml: string | null = null;
 
       if (responseVerifiedXml) {
         validSignature = true;
+        verifiedPem = responseVerification.pemFile;
         const verifiedDom = await parseDomFromString(responseVerifiedXml);
         verifiedInResponseTo = getRootAttribute(verifiedDom, "InResponseTo");
         verifiedDestination = getRootAttribute(verifiedDom, "Destination");
@@ -1248,7 +1480,7 @@ class SAML {
           // Checked only when present: an error response may omit it even when signed, and a login is
           // checked on its assertion's Issuer, which is required (SAML profiles §4.1.4.2, Errata 05 E17).
           if (verifiedDoc.Response?.Issuer) {
-            this.verifyIssuer(verifiedDoc.Response);
+            this.verifyIssuer(verifiedDoc.Response, validationTrust.issuer);
           }
         }
       }
@@ -1274,9 +1506,19 @@ class SAML {
 
       if (assertions.length == 1) {
         if (this.options.wantAssertionsSigned || !validSignature) {
-          assertionVerifiedXml = getVerifiedXml(xml, assertions[0], pemFiles);
+          validationStage = "assertion";
+          const assertionVerification: { pemFile?: string } = {};
+          assertionVerifiedXml = getVerifiedXml(
+            xml,
+            assertions[0],
+            pemFiles,
+            assertionVerification,
+          );
           if (!assertionVerifiedXml) {
             throw new Error("Invalid signature");
+          }
+          if (responseVerifiedXml == null) {
+            verifiedPem = assertionVerification.pemFile;
           }
         }
       }
@@ -1296,13 +1538,19 @@ class SAML {
         if (decryptedAssertions.length != 1) throw new Error("Invalid EncryptedAssertion content");
 
         if (this.options.wantAssertionsSigned || !validSignature) {
+          validationStage = "encrypted-assertion";
+          const decryptedVerification: { pemFile?: string } = {};
           decryptedAssertionVerifiedXml = getVerifiedXml(
             decryptedXml,
             decryptedAssertions[0],
             pemFiles,
+            decryptedVerification,
           );
           if (decryptedAssertionVerifiedXml == null) {
             throw new Error("Invalid signature from encrypted assertion");
+          }
+          if (responseVerifiedXml == null) {
+            verifiedPem = decryptedVerification.pemFile;
           }
         }
       }
@@ -1312,6 +1560,10 @@ class SAML {
       // collect the verified XML's
       const verifiedXml =
         responseVerifiedXml || assertionVerifiedXml || decryptedAssertionVerifiedXml;
+      if (responseVerifiedXml != null) {
+        validationStage = "response";
+        verifiedPem = responseVerification.pemFile;
+      }
 
       // double check that there is at least 1 assertion
       if (verifiedXml && assertions.length + encryptedAssertions.length == 1) {
@@ -1329,7 +1581,11 @@ class SAML {
           xml,
           responseVerifiedXml ? verifiedInResponseTo : inResponseTo,
           responseVerifiedXml != null,
+          validationTrust.issuer,
         );
+        if (result?.profile != null && trust != null) {
+          applyTrustReport(result.profile, trustReport(trust, validationStage, verifiedPem));
+        }
         // Consumed here, not in the overridable method, whose inResponseToIsVerified an override
         // written before that parameter drops. Unless the Response is signed, only the assertion
         // can name the request it answers.
@@ -1416,7 +1672,7 @@ class SAML {
         }
         const logoutResponse = xmljsDoc.LogoutResponse;
         if (logoutResponse) {
-          await this.verifyLogoutResponse(xmljsDoc);
+          await this.verifyLogoutResponse(xmljsDoc, validationTrust.issuer);
           if (this.mustValidateInResponseTo(Boolean(verifiedInResponseTo))) {
             await consumeInResponseToAsync(this.cacheProvider, verifiedInResponseTo);
           }
@@ -1432,6 +1688,9 @@ class SAML {
         }
       }
     } catch (err) {
+      if (trust != null) {
+        attachTrustReport(err, trustReport(trust, validationStage, verifiedPem));
+      }
       debugLog.enabled && debugLog("validatePostResponse resulted in an error: %s", err);
       // A failure the IdP signed means it answered the request, so no other response is coming.
       // An unsigned one proves nothing about the request it names, so that request stays pending.
@@ -1526,16 +1785,19 @@ class SAML {
     const dom = await parseDomFromString(inflated.toString());
     const doc: XMLOutput = await parseXml2JsFromString(inflated);
     // Before the checks below, so a signed response that fails them still retires its request.
-    await this.hasValidSignatureForRedirect(container, originalQuery);
+    const trustOut: TrustOut = {};
+    const verification: { pemFile?: string } = {};
+    await this.hasValidSignatureForRedirect(container, originalQuery, trustOut, verification);
+    const redirectTrust = trustOut.trust;
     if (samlMessageType === "SAMLRequest") {
-      this.verifyLogoutRequest(doc);
+      this.verifyLogoutRequest(doc, redirectTrust?.issuer);
     } else {
       // Retired here, not in the overridable processing method, so an override can't lose track of
       // whether the message was signed. An unsigned one can name anyone's pending request.
       const signedInResponseTo = signed ? doc.LogoutResponse.$.InResponseTo : null;
       const retire = signedInResponseTo != null && this.mustValidateInResponseTo(true);
       try {
-        await this.verifyLogoutResponse(doc);
+        await this.verifyLogoutResponse(doc, redirectTrust?.issuer);
       } catch (err) {
         if (retire) {
           await this.cacheProvider.removeAsync(signedInResponseTo);
@@ -1546,7 +1808,21 @@ class SAML {
         await consumeInResponseToAsync(this.cacheProvider, signedInResponseTo);
       }
     }
-    const result = await this.processValidlySignedSamlLogoutAsync(doc, dom);
+    const result = await this.processValidlySignedSamlLogoutAsync(
+      doc,
+      dom,
+      redirectTrust?.issuer,
+    );
+    if (signed && result?.profile != null && redirectTrust != null) {
+      applyTrustReport(
+        result.profile,
+        trustReport(
+          redirectTrust,
+          samlMessageType === "SAMLRequest" ? "logout-request" : "logout-response",
+          verification.pemFile,
+        ),
+      );
+    }
     if (signed) {
       const messageName = samlMessageType === "SAMLRequest" ? "LogoutRequest" : "LogoutResponse";
       warnIfDestinationIsNot(
@@ -1567,6 +1843,8 @@ class SAML {
   protected async hasValidSignatureForRedirect(
     container: ParsedQs,
     originalQuery: string,
+    trustOut?: TrustOut,
+    verification?: { pemFile?: string },
   ): Promise<boolean | void> {
     // A parse can lose a Signature that the query string has, and one can be present and empty.
     // Either way the message claims a signature.
@@ -1576,13 +1854,14 @@ class SAML {
         throw new Error("The query string has no Signature parameter");
       }
 
-      const pemFiles = await this.getKeyInfosAsPem();
+      const pemFiles = await this.getKeyInfosAsPem(trustOut);
       const hasValidQuerySignature = pemFiles.some((pemFile) => {
         return this.validateSignatureForRedirect(
           signed.octets,
           signed.signature,
           signed.sigAlg,
           pemFile,
+          verification,
         );
       });
       if (!hasValidQuerySignature) {
@@ -1609,11 +1888,16 @@ class SAML {
     signature: string,
     alg: string,
     pemFile: string,
+    verification?: { pemFile?: string },
   ): boolean {
     // xml-crypto types the signed octets as a string, which is what this library passes.
     const signatureAlgorithm = algorithms.findSignatureAlgorithm(alg);
     if (signatureAlgorithm && typeof urlString === "string") {
-      return signatureAlgorithm.verifySignature(urlString, pemFile, signature);
+      const verified = signatureAlgorithm.verifySignature(urlString, pemFile, signature);
+      if (verified && verification != null) {
+        verification.pemFile = pemFile;
+      }
+      return verified;
     }
 
     // An identifier xml-crypto does not implement, such as rsa-sha384, is looked up among
@@ -1636,6 +1920,9 @@ class SAML {
     verifier.update(urlString);
 
     const verified = verifier.verify(pemFile, signature, "base64");
+    if (verified && verification != null) {
+      verification.pemFile = pemFile;
+    }
     // The next major version still verifies rsa-sha384, so it gets no warning.
     if (
       verified &&
@@ -1655,8 +1942,8 @@ class SAML {
    *   `validateRedirectAsync` returns instead of overriding this: an override can weaken the
    *   validation of an incoming message, so the next major version makes this method private.
    */
-  protected verifyLogoutRequest(doc: XMLOutput): void {
-    this.verifyIssuer(doc.LogoutRequest);
+  protected verifyLogoutRequest(doc: XMLOutput, expectedIdpIssuer?: string | null): void {
+    this.verifyIssuer(doc.LogoutRequest, expectedIdpIssuer);
     const nowMs = new Date().getTime();
     const conditions = doc.LogoutRequest.$;
     const conErr = this.checkTimestampsValidityError(
@@ -1674,12 +1961,15 @@ class SAML {
    *   `validateRedirectAsync` returns instead of overriding this: an override can weaken the
    *   validation of an incoming message, so the next major version makes this method private.
    */
-  protected async verifyLogoutResponse(doc: XMLOutput): Promise<void> {
+  protected async verifyLogoutResponse(
+    doc: XMLOutput,
+    expectedIdpIssuer?: string | null,
+  ): Promise<void> {
     const statusCode = doc.LogoutResponse.Status?.[0].StatusCode?.[0].$?.Value;
     if (statusCode !== "urn:oasis:names:tc:SAML:2.0:status:Success")
       throw new Error("Bad status code: " + statusCode);
 
-    this.verifyIssuer(doc.LogoutResponse);
+    this.verifyIssuer(doc.LogoutResponse, expectedIdpIssuer);
     return this.validateInResponseTo(doc.LogoutResponse.$.InResponseTo ?? null);
   }
 
@@ -1688,15 +1978,20 @@ class SAML {
    *   `validateRedirectAsync` returns instead of overriding this: an override can weaken the
    *   validation of an incoming message, so the next major version makes this method private.
    */
-  protected verifyIssuer(samlMessage: XMLOutput): void {
+  protected verifyIssuer(
+    samlMessage: XMLOutput,
+    expectedIdpIssuer?: string | null,
+  ): void {
+    const expectedIssuer =
+      expectedIdpIssuer === undefined ? (this.options.idpIssuer ?? null) : expectedIdpIssuer;
     assertOneIssuer((samlMessage.Issuer ?? []).map((issuer: XMLOutput) => issuer._));
-    if (this.options.idpIssuer != null) {
+    if (expectedIssuer != null) {
       const issuer = samlMessage.Issuer;
       if (issuer) {
-        if (issuer[0]._ !== this.options.idpIssuer)
+        if (issuer[0]._ !== expectedIssuer)
           throw new Error(
             "Unknown SAML issuer. Expected: " +
-              this.options.idpIssuer +
+              expectedIssuer +
               " Received: " +
               issuer[0]._,
           );
@@ -1717,6 +2012,7 @@ class SAML {
     samlResponseXml: string, // the response as received, not as verified; backs getSamlResponseXml()
     inResponseTo: string | null,
     inResponseToIsVerified = false, // whether a verified Response signature covers inResponseTo
+    expectedIdpIssuer?: string | null,
   ): Promise<{ profile: Profile; loggedOut: boolean }> {
     let msg;
     const nowMs = new Date().getTime();
@@ -1726,7 +2022,7 @@ class SAML {
     const doc: XMLOutput = await parseXml2JsFromString(xml);
     const parsedAssertion: XMLOutput = doc;
     const assertion: XMLOutput = doc.Assertion;
-    this.verifyIssuer(assertion);
+    this.verifyIssuer(assertion, expectedIdpIssuer);
     getInResponseTo: {
       const issuer = assertion.Issuer;
       if (issuer && issuer[0]._) {
@@ -2078,24 +2374,52 @@ class SAML {
     },
   ): Promise<{ profile: Profile; loggedOut: boolean }> {
     warnIgnoredInjectedDependencies(legacyInjectedDependencies);
-    const xml = Buffer.from(container.SAMLRequest, "base64").toString("utf8");
-    // The document as received locates the signature; only what that signature covers is read.
-    const receivedDom = await parseDomFromString(xml);
-    const pemFiles = await this.getKeyInfosAsPem();
-    const verifiedXml = getVerifiedXml(xml, receivedDom.documentElement, pemFiles);
-    if (verifiedXml == null) {
-      throw new Error("Invalid signature on documentElement");
+    let trust: ResolvedIdpTrust | null = null;
+    const validationStage: SamlValidationStage = "logout-request";
+    let verifiedPem: string | undefined;
+    try {
+      const xml = Buffer.from(container.SAMLRequest, "base64").toString("utf8");
+      // The document as received locates the signature; only what that signature covers is read.
+      const receivedDom = await parseDomFromString(xml);
+      const trustOut: TrustOut = {};
+      const pemFiles = await this.getKeyInfosAsPem(trustOut);
+      const currentTrust =
+        trustOut.trust ?? createTrust(pemFiles, this.options.idpIssuer ?? null);
+      trust = currentTrust;
+      const verification: { pemFile?: string } = {};
+      const verifiedXml = getVerifiedXml(
+        xml,
+        receivedDom.documentElement,
+        pemFiles,
+        verification,
+      );
+      if (verifiedXml == null) {
+        throw new Error("Invalid signature on documentElement");
+      }
+      verifiedPem = verification.pemFile;
+      const verifiedDom = await parseDomFromString(verifiedXml);
+      const verifiedDoc = await parseXml2JsFromString(verifiedXml);
+      const result = await this.processValidlySignedPostRequestAsync(
+        verifiedDoc,
+        verifiedDom,
+        currentTrust.issuer,
+      );
+      if (result?.profile != null) {
+        applyTrustReport(result.profile, trustReport(currentTrust, validationStage, verifiedPem));
+      }
+      warnIfDestinationIsNot(
+        "logoutCallbackUrl",
+        this.options.logoutCallbackUrl,
+        "LogoutRequest",
+        getRootAttribute(verifiedDom, "Destination"),
+      );
+      return result;
+    } catch (err) {
+      if (trust != null) {
+        attachTrustReport(err, trustReport(trust, validationStage, verifiedPem));
+      }
+      throw err;
     }
-    const verifiedDom = await parseDomFromString(verifiedXml);
-    const verifiedDoc = await parseXml2JsFromString(verifiedXml);
-    const result = await this.processValidlySignedPostRequestAsync(verifiedDoc, verifiedDom);
-    warnIfDestinationIsNot(
-      "logoutCallbackUrl",
-      this.options.logoutCallbackUrl,
-      "LogoutRequest",
-      getRootAttribute(verifiedDom, "Destination"),
-    );
-    return result;
   }
 
   /**
@@ -2107,9 +2431,10 @@ class SAML {
     this: SAML,
     doc: XMLOutput,
     dom: Document,
+    expectedIdpIssuer?: string | null,
   ): Promise<{ profile: Profile; loggedOut: boolean }> {
     const request = doc.LogoutRequest;
-    this.verifyLogoutRequest(doc);
+    this.verifyLogoutRequest(doc, expectedIdpIssuer);
     if (request) {
       const profile = {} as Profile;
       if (request.$.ID) {
@@ -2151,6 +2476,7 @@ class SAML {
     this: SAML,
     doc: XMLOutput,
     dom: Document,
+    expectedIdpIssuer?: string | null,
   ): Promise<{ profile: Profile | null; loggedOut: boolean }> {
     const response = doc.LogoutResponse;
     const request = doc.LogoutRequest;
@@ -2158,7 +2484,7 @@ class SAML {
     if (response) {
       return { profile: null, loggedOut: true };
     } else if (request) {
-      return await this.processValidlySignedPostRequestAsync(doc, dom);
+      return await this.processValidlySignedPostRequestAsync(doc, dom, expectedIdpIssuer);
     } else {
       throw new Error("Unknown SAML response message");
     }
