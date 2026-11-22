@@ -289,6 +289,50 @@ describe("published type surface", function () {
     expect(errors).to.contain("error TS");
   });
 
+  it("exposes the metadata publisher and a consumer-written MetadataStore", function () {
+    const errors = typeCheck(`
+      import {
+        InMemoryMetadataStore,
+        MetadataStore,
+        PublishedServiceProviderMetadata,
+        SAML,
+        ServiceProviderMetadataPublisher,
+      } from ${packageEntry};
+
+      class DurableMetadataStore implements MetadataStore {
+        async saveIfNewerAsync(
+          record: PublishedServiceProviderMetadata,
+        ): Promise<PublishedServiceProviderMetadata> {
+          return record;
+        }
+        async getLatestAsync(): Promise<PublishedServiceProviderMetadata | null> {
+          return null;
+        }
+        async getByGenerationAsync(): Promise<PublishedServiceProviderMetadata | null> {
+          return null;
+        }
+      }
+
+      declare const saml: SAML;
+      const publisher: ServiceProviderMetadataPublisher =
+        saml.createServiceProviderMetadataPublisher(new DurableMetadataStore());
+      const inMemory: ServiceProviderMetadataPublisher = new ServiceProviderMetadataPublisher(
+        new InMemoryMetadataStore(),
+      );
+      void publisher.publishForSamlOptionsAsync(saml.options, { publicCerts: ["cert"] });
+      void publisher.publishAsync({
+        issuer: "https://sp.example.com",
+        callbackUrl: "https://sp.example.com/callback",
+        generation: 3,
+      });
+
+      void publisher;
+      void inMemory;
+    `);
+
+    expect(errors).to.equal("");
+  });
+
   // The parameter and its exact published type stay until the next major, because a 5.1 consumer has
   // to keep compiling. That it can no longer alter verification is `test-signatures.spec.ts`'s job.
   it("still accepts the injected-dependency argument it no longer honors", function () {

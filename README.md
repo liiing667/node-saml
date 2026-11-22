@@ -424,6 +424,69 @@ while an omitted `digestAlgorithm` selects `sha1`, or is an error too when `sign
 `"sha256-mgf1"`. The note under [`signatureAlgorithm`](#configuration-option-signaturealgorithm)
 applies to this function too, and it logs the same warnings under `NODE_DEBUG=node-saml`.
 
+#### Publishing metadata as recoverable generations
+
+The calls above build one document from the arguments of one call. When an application rotates
+certificates or moves its `callbackUrl`, it must not let an identity provider read a document that
+mixes two configurations: a signature listing a new certificate while decryption still only knows
+the old one, or an old and a new ACS location in the same output. `ServiceProviderMetadataPublisher`
+publishes whole documents as numbered generations so that cannot happen.
+
+```javascript
+const { ServiceProviderMetadataPublisher } = require("@node-saml/node-saml");
+
+const publisher = saml.createServiceProviderMetadataPublisher();
+
+// Builds the complete document — certificates, signature when signMetadata is set, and ACS
+// location — and only then commits it as generation 1.
+const first = await publisher.publishForSamlOptionsAsync(saml.options, {
+  decryptionCert,
+  publicCerts,
+});
+
+// A later rotation takes the next consecutive generation.
+const rotated = await publisher.publishForSamlOptionsAsync(saml.options, {
+  decryptionCert,
+  publicCerts: [currentCert, upcomingCert],
+});
+
+// Every consumer reads the same complete document. Two reads of one generation are byte-identical
+// and share its SHA-256 `fingerprint`.
+const published = await publisher.getLatestAsync();
+```
+
+`publishForSamlOptionsAsync` builds on the `SAML` instance's own options — its issuer, ACS
+location, signing key and signature settings — so a publication cannot carry material that
+disagrees with what the instance signs and validates with; only the certificates and other
+rotation-specific values are passed per call. The underlying `publishAsync(params)` remains
+available on a standalone `new ServiceProviderMetadataPublisher()`, taking the same full parameter
+object as `generateServiceProviderMetadata` plus an optional explicit `generation`.
+
+The rules this gives you:
+
+- **No half update.** The document is built in full, including its signature, before the store is
+  touched. If building or signing fails, the previously published generation stays exactly as it
+  was; no generation 2 exists until a complete one commits.
+- **A failed update, a retry, or a restart publishes only a complete old document or a complete new
+  one.** A generation number must be strictly greater than the one already stored, so a retried or
+  replayed publication cannot move the shared view backwards or fork it.
+- **Consumers agree.** `getLatestAsync()` and `getByGenerationAsync()` return one immutable record
+  carrying `generation`, `metadataXml`, `fingerprint` (SHA-256 of the bytes) and `publishedAtMs`.
+  Two consumers reading one generation can compare fingerprints and know they hold identical bytes.
+- **The dual-certificate window is unchanged.** Pass an array of `publicCerts` exactly as before:
+  the first matches the current `privateKey`, and later entries publish upcoming certificates. All
+  of them, plus the encryption certificate and the ACS location, move together in one generation.
+- **Ordinary and unsigned metadata are unchanged.** A publisher with no key options emits the same
+  unsigned document as `generateServiceProviderMetadata`; signing still happens only when
+  `signMetadata` is `true` and `privateKey` is set.
+
+`new ServiceProviderMetadataPublisher()` uses an in-memory store, which shares generations between
+the `SAML` instances in one process but cannot survive a restart or reach another process. In a
+multi-process deployment, implement the `MetadataStore` interface (`saveIfNewerAsync`,
+`getLatestAsync`, `getByGenerationAsync`) on top of your shared, durable storage. Each method has to
+complete as one atomic operation; then every process restarting mid-publication still serves only
+complete generations.
+
 ## Config parameter details
 
 ### Required

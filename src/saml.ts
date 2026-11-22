@@ -15,6 +15,7 @@ import {
   buildServiceProviderMetadata,
   warnIfContactOrOrganizationInvalid,
 } from "./metadata";
+import { MetadataStore, ServiceProviderMetadataPublisher } from "./metadata-publisher";
 import { signAuthnRequestPost } from "./saml-post-signing";
 import {
   AudienceRestrictionXML,
@@ -2170,6 +2171,20 @@ class SAML {
     publicCerts?: string | string[] | null,
   ): string {
     return buildServiceProviderMetadata({ ...this.options, decryptionCert, publicCerts });
+  }
+
+  /**
+   * Returns a publisher that commits this instance's metadata as recoverable generations. The
+   * certificate material, the metadata signature and the ACS location are built into one complete
+   * document before anything is published, so a failed rotation, a retry or a restart can never
+   * expose a document assembled from two configurations. Pass a shared {@link MetadataStore} to
+   * publish from more than one process.
+   */
+  createServiceProviderMetadataPublisher(
+    this: SAML,
+    store?: MetadataStore,
+  ): ServiceProviderMetadataPublisher {
+    return new ServiceProviderMetadataPublisher(store);
   }
 
   /**

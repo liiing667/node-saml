@@ -1,5 +1,12 @@
 import { SAML } from "./saml";
 import { generateServiceProviderMetadata } from "./metadata";
+import {
+  InMemoryMetadataStore,
+  MetadataStore,
+  PublishServiceProviderMetadataParams,
+  PublishedServiceProviderMetadata,
+  ServiceProviderMetadataPublisher,
+} from "./metadata-publisher";
 import { CacheProviderOptions, InMemoryCacheProvider } from "./in-memory-cache-provider";
 import {
   AudienceRestrictionXML,
@@ -30,7 +37,12 @@ import {
 export {
   SAML,
   generateServiceProviderMetadata,
+  ServiceProviderMetadataPublisher,
+  InMemoryMetadataStore,
   GenerateServiceProviderMetadataParams,
+  PublishServiceProviderMetadataParams,
+  PublishedServiceProviderMetadata,
+  MetadataStore,
   CacheItem,
   CacheProvider,
   CacheProviderOptions,
