@@ -93,6 +93,89 @@ export type IdpCertCallback = (
 ) => void;
 
 /**
+ * A private key used to decrypt encrypted assertions and encrypted name identifiers.
+ */
+export type DecryptionPvk = string | Buffer;
+
+/**
+ * Supplies decryption private keys for one validation. Resolved once per message, so a key
+ * rotation that happens while the message is being validated cannot change the key used for it.
+ */
+export type DecryptionPvkCallback = (
+  callback: (err: Error | null, privateKey?: DecryptionPvk | DecryptionPvk[]) => void,
+) => void;
+
+/**
+ * A decryption key, a rotation window of several keys, or a callback that supplies either.
+ */
+export type DecryptionPvkOption =
+  | DecryptionPvk
+  | DecryptionPvk[]
+  | DecryptionPvkCallback
+  | (() => DecryptionPvk | DecryptionPvk[] | Promise<DecryptionPvk | DecryptionPvk[]>);
+
+/**
+ * The point at which an encrypted response was accepted or rejected.
+ */
+export type EncryptedResponseStage =
+  | "admission"
+  | "decrypt"
+  | "decrypted"
+  | "verify-signature"
+  | "profile"
+  | "complete";
+
+/**
+ * The identities that authenticate one encrypted response: the ciphertext, the relying party's
+ * decryption key, the assertion it holds, and the stage that accepted or rejected it.
+ */
+export interface EncryptedResponseReport {
+  /** The EncryptedAssertion element as received, before any decryption. */
+  cipher: string;
+  /** Alias for `cipher`. */
+  cipherText: string;
+  /** A stable digest of `cipher`. */
+  cipherDigest: string;
+  /** Alias for `cipherDigest`. */
+  ciphertextDigest: string;
+  /** The EncryptedAssertion element's XML ID, when it has one. */
+  encryptedAssertionId: string | null;
+  /** All keys this validation was allowed to use, by public-key fingerprint. */
+  decryptionKeys: string[];
+  /** Generation identity of the complete key set frozen for this validation. */
+  decryptionKeyGeneration: string | null;
+  /** Alias for `decryptionKeyGeneration`. */
+  decryptKeyGeneration: string | null;
+  /** Fingerprint of the key that decrypted the ciphertext, when one did. */
+  decryptKey: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKey: string | null;
+  /** Alias for `decryptKey`. */
+  decryptKeyFingerprint: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKeyFingerprint: string | null;
+  /**
+   * The decrypted assertion XML after a signature covered the ciphertext or the assertion. Null on
+   * a rejection, where only `assertionId` and `assertionDigest` are reported.
+   */
+  assertion: string | null;
+  /** The decrypted assertion's XML ID, when it has one. */
+  assertionId: string | null;
+  /** A stable digest of `assertion`. */
+  assertionDigest: string | null;
+  /** Whether decryption produced an assertion. */
+  decrypted: boolean;
+  /** Whether a signature covered the ciphertext or the decrypted assertion. */
+  signatureVerified: boolean;
+  /** The stage reached by this validation. */
+  stage: EncryptedResponseStage;
+  /** Alias for `stage`. */
+  validationStage: EncryptedResponseStage;
+  /** The stage that rejected the message, or null while it has not been rejected. */
+  failureStage: EncryptedResponseStage | null;
+}
+
+/**
  * These are SAML options that must be provided to construct a new SAML Strategy
  */
 export interface MandatorySamlOptions {
@@ -302,7 +385,7 @@ export interface AttributeConsumingService {
 export interface SamlOptions extends Partial<SamlSigningOptions>, MandatorySamlOptions {
   // Core
   entryPoint?: string;
-  decryptionPvk?: string | Buffer;
+  decryptionPvk?: DecryptionPvkOption;
 
   // Additional SAML behaviors
   additionalParams: Record<string, string>;
@@ -449,6 +532,47 @@ export interface Profile {
    * version; use `getAssertionXml()` or `getAssertion()`.
    */
   getSamlResponseXml?(): string;
+  /**
+   * The ciphertext, decryption key, assertion and stage that authenticated this profile. Set only
+   * for a response whose assertion arrived as an EncryptedAssertion.
+   */
+  encryptedResponse?: EncryptedResponseReport;
+  /** Alias for `encryptedResponse`. */
+  decryption?: EncryptedResponseReport;
+  /** The EncryptedAssertion element as received. */
+  cipher?: string;
+  /** Alias for `cipher`. */
+  cipherText?: string;
+  /** A stable digest of `cipher`. */
+  cipherDigest?: string;
+  /** Alias for `cipherDigest`. */
+  ciphertextDigest?: string;
+  /** Fingerprint of the key that decrypted the ciphertext. */
+  decryptKey?: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKey?: string | null;
+  /** Alias for `decryptKey`. */
+  decryptKeyFingerprint?: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKeyFingerprint?: string | null;
+  /** Generation identity of the decryption key set frozen for this profile. */
+  decryptionKeyGeneration?: string | null;
+  /** Alias for `decryptionKeyGeneration`. */
+  decryptKeyGeneration?: string | null;
+  /** The verified decrypted assertion XML. */
+  assertion?: string | null;
+  /** The verified decrypted assertion's XML ID. */
+  assertionId?: string | null;
+  /** A stable digest of `assertion`. */
+  assertionDigest?: string | null;
+  /** Whether a signature covered the ciphertext or the decrypted assertion. */
+  signatureVerified?: boolean;
+  /** The stage that produced this profile. */
+  validationStage?: EncryptedResponseStage;
+  /** Alias for `validationStage`. */
+  verificationStage?: EncryptedResponseStage;
+  /** Alias for `validationStage`. */
+  stage?: EncryptedResponseStage;
   [attributeName: string]: unknown; // arbitrary `AttributeValue`s
 }
 

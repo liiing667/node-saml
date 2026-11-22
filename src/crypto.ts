@@ -58,6 +58,33 @@ export const decryptionPvkToPem = (decryptionPvk: string | Buffer): string | Buf
   return privateKeyToPem(decryptionPvk, "decryptionPvk");
 };
 
+/**
+ * A stable identity for a decryption private key. It hashes the public half, so the fingerprint
+ * can be reported without exposing the private key, and so the same key gets the same identity
+ * whether it arrived as PEM, Base64, PKCS #1 or PKCS #8.
+ */
+export const decryptionPvkFingerprint = (decryptionPvk: string | Buffer): string => {
+  const pem = decryptionPvkToPem(decryptionPvk);
+  try {
+    const publicDer = crypto
+      .createPublicKey(crypto.createPrivateKey(pem))
+      .export({ type: "spki", format: "der" });
+    return `sha256:${crypto.createHash("sha256").update(publicDer).digest("hex")}`;
+  } catch {
+    const material = Buffer.isBuffer(pem) ? pem : Buffer.from(pem, "latin1");
+    return `sha256:${crypto.createHash("sha256").update(material).digest("hex")}`;
+  }
+};
+
+/**
+ * A stable identity for a decryption key set. Order and duplicates do not change the generation,
+ * so the same rotation window keeps the same identity.
+ */
+export const decryptionPvkGeneration = (fingerprints: string[]): string => {
+  const identity = JSON.stringify([...new Set(fingerprints)].sort());
+  return `sha256:${crypto.createHash("sha256").update(identity).digest("hex")}`;
+};
+
 export const keyInfoToBase64Certificate = (
   keyInfo: string | Buffer,
   optionName: string,

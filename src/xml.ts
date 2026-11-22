@@ -45,8 +45,23 @@ export const xpath = {
     selectXPath(elementsXPathTypeGuard, node, xpath),
 };
 
-export const decryptXml = async (xml: string, decryptionPvk: string | Buffer) =>
-  util.promisify(xmlenc.decrypt).bind(xmlenc)(xml, { key: decryptionPvkToPem(decryptionPvk) });
+export const decryptXml = async (
+  xml: string,
+  decryptionPvk: string | Buffer | Array<string | Buffer>,
+): Promise<string> => {
+  const decrypt = util.promisify(xmlenc.decrypt).bind(xmlenc);
+  const decryptionKeys = Array.isArray(decryptionPvk) ? decryptionPvk : [decryptionPvk];
+  let lastError: unknown;
+  for (const decryptionKey of decryptionKeys) {
+    try {
+      return (await decrypt(xml, { key: decryptionPvkToPem(decryptionKey) })) as string;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError ?? new Error("No decryption key for encrypted SAML response");
+};
 
 const encryptionMethod = (element: Element): Element | undefined =>
   xpath.selectElements(
@@ -445,7 +460,7 @@ export const promiseWithNameId = async (nameid: Node): Promise<NameID> => {
 
 export const getNameIdAsync = async (
   doc: Node,
-  decryptionPvk: string | Buffer | null,
+  decryptionPvk: string | Buffer | Array<string | Buffer> | null,
 ): Promise<NameID> => {
   const nameIds = xpath.selectElements(
     doc,
@@ -478,14 +493,26 @@ export const getNameIdAsync = async (
     }
     const encryptedDataXml = encryptedData[0].toString();
 
-    const decryptedXml = await decryptXml(encryptedDataXml, decryptionPvk);
     warnIfDecryptionWillFailInNextMajor(encryptedIds[0]);
-    const decryptedDoc = await parseDomFromString(decryptedXml);
-    const decryptedIds = xpath.selectElements(decryptedDoc, "/*[local-name()='NameID']");
-    if (decryptedIds.length !== 1) {
-      throw new Error("Invalid EncryptedData content");
+    const decryptionKeys = Array.isArray(decryptionPvk) ? decryptionPvk : [decryptionPvk];
+    let lastError: unknown;
+    for (const decryptionKey of decryptionKeys) {
+      try {
+        const decryptedXml = await decryptXml(encryptedDataXml, decryptionKey);
+        const decryptedDoc = await parseDomFromString(decryptedXml);
+        const decryptedIds = xpath.selectElements(decryptedDoc, "/*[local-name()='NameID']");
+        if (decryptedIds.length !== 1) {
+          lastError = new Error("Invalid EncryptedData content");
+          continue;
+        }
+        return await promiseWithNameId(decryptedIds[0]);
+      } catch (error) {
+        lastError = error;
+      }
     }
-    return await promiseWithNameId(decryptedIds[0]);
+    const error =
+      lastError ?? new Error("No decryption key found getting name ID for encrypted SAML response");
+    throw error;
   }
   throw new Error("Missing SAML NameID");
 };

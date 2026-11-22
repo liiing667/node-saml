@@ -885,6 +885,30 @@ To decrypt encrypted assertions and encrypted name identifiers, provide the SP's
 decryptionPvk: "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCXJP47MTKaFpkU ... ==";
 ```
 
+During a key rotation, pass the keys that may still receive ciphertext as an array:
+
+```javascript
+decryptionPvk: [currentPrivateKey, previousPrivateKey];
+```
+
+Each validation resolves the key set once, before decrypting, and uses the first key that decrypts
+the ciphertext. The decrypted assertion used for signature verification and for the profile is the
+same byte-for-byte value; the library does not decrypt again with a later key. A callback returning
+a key or an array of keys can rotate the set without a restart, and is resolved once per message:
+
+```javascript
+decryptionPvk: (callback) => {
+  callback(null, currentPrivateKeys);
+};
+```
+
+For an `EncryptedAssertion`, the returned profile also reports the ciphertext digest, the decryption
+key fingerprint and generation, the assertion digest, and the stage that authenticated it. A
+rejection carries the same evidence on the thrown error, so a failure after decryption names the
+key that was actually used rather than the key currently configured. A rejected decryption reports
+the assertion's ID and digest, not its unverified plaintext. Fingerprints come from the key's public
+half, so the same rotation window has the same generation after a restart and across processes.
+
 Accepted formats:
 
 1. PEM, handed to Node's crypto as given. That is how `decryptionPvk` has always been read, so
