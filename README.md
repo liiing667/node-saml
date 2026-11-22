@@ -105,9 +105,10 @@ than in the middle of someone's login.
 
 In TypeScript, the constructor takes a `SamlConfig` and `saml.options` is a `SamlOptions`. Both are
 exported from the package root, and so is every other type the package's API uses: `Profile`,
-`CacheProvider`, `CacheItem`, `InMemoryCacheProvider` and its `CacheProviderOptions`,
-`ValidateInResponseTo`, `RacComparison`, `SignatureAlgorithm`, `SamlSigningOptions`,
-`SamlScopingConfig`, `SamlIDPListConfig`, `SamlIDPEntryConfig`, `IdpCertCallback`, `AuthOptions`,
+`AssertionSession`, `CacheProvider`, `CacheItem`, `InMemoryCacheProvider` and its
+`CacheProviderOptions`, `ValidateInResponseTo`, `RacComparison`, `SignatureAlgorithm`,
+`SamlSigningOptions`, `SamlScopingConfig`, `SamlIDPListConfig`, `SamlIDPEntryConfig`,
+`IdpCertCallback`, `AuthOptions`,
 `MandatorySamlOptions`, `SamlStatusError`, `GenerateServiceProviderMetadataParams`, and the XML types
 that `SAML`'s protected methods use: `XMLOutput`, `XmlJsObject`, `AudienceRestrictionXML`,
 `XMLObject`, and `XMLValue`.
@@ -226,12 +227,28 @@ rely on rather than assuming they are all present.
 | `nameID`, `nameIDFormat`           | The subject's name identifier and its format.                                                                    |
 | `nameQualifier`, `spNameQualifier` | Name qualifiers, when the assertion carries them.                                                                |
 | `sessionIndex`                     | The `AuthnStatement`'s `SessionIndex`; you need it to build a logout request.                                    |
+| `sessionIndexes`                   | Every `SessionIndex` in the response, in assertion order. Pass the profile to a logout request to end them all.  |
+| `assertions`, `sessions`           | One entry per accepted assertion: verified XML, parsed assertion, subject, `SessionIndex` values, profile.       |
+| `subjects`                         | The distinct `NameID` values the accepted assertions establish.                                                  |
 | `inResponseTo`                     | The `InResponseTo` a signature covers: the `Response`'s if signed, else the `SubjectConfirmationData`'s.         |
 | `mail`, `email`                    | Convenience aliases. `mail` falls back to `urn:oid:0.9.2342.19200300.100.1.3`, and `email` falls back to `mail`. |
 | `attributes`                       | Every attribute as a `Name` → value map. Single-valued attributes are strings; repeated ones are arrays.         |
 | `getAssertionXml()`                | The assertion XML **that the signature covers**. This is the trustworthy copy.                                   |
 | `getAssertion()`                   | The same assertion, parsed into a JavaScript object.                                                             |
+| `getAssertionsXml()`               | Every assertion XML the signature covered, in assertion order.                                                   |
+| `getAssertions()`                  | The same assertions, parsed into JavaScript objects.                                                             |
 | `getSamlResponseXml()`             | **Deprecated.** The response XML as received, **not as verified**. See the warning below.                        |
+
+When a `Response` carries more than one assertion, each assertion is verified and recorded before
+any of them is accepted. The response is one transaction: a replay, a bad signature, or any other
+rejection consumes none of its assertion IDs. `sessionIndex` and `getAssertionXml()` keep returning
+the first assertion for callers written before multi-assertion support; `sessions` (also available
+as `assertions`) lists every assertion and its subject and `SessionIndex` so each IdP session can
+be traced and terminated. A `LogoutRequest` built from such a profile carries every distinct
+`SessionIndex` belonging to the profile's `NameID`; sessions for another subject in the same
+response stay in `sessions` so the caller can terminate them separately.
+`assertionXmls` and `parsedAssertions` expose the same assertion values without the per-session
+metadata, and each session entry also has `getAssertionXml()` and `getAssertion()`.
 
 Attributes are also copied onto `profile` at the top level for convenience, but an attribute never
 overwrites a field the library set itself.
@@ -684,11 +701,12 @@ explain rejections that might otherwise look overly strict:
   and that is the content the library goes on to process. The original document is never re-read
   after verification, because an attacker controls the difference between the two — that is the
   whole of an XML signature wrapping attack.
-- **Ambiguity is rejected, not resolved.** A response with more than one assertion, an assertion, a
-  logout message or a signed `Response` with more than one `Issuer`, more than one signature on an
-  element, an `ID` resolving to more than one element, a reference pointing anywhere other than its
-  own parent, or more than two transforms is refused. The library does not pick a reading, and it
-  does not pick the reading that happens to verify.
+- **Ambiguity is rejected, not resolved.** An assertion, logout message or signed `Response` with
+  more than one `Issuer`, more than one signature on an element, an `ID` resolving to more than one
+  element, a reference pointing anywhere other than its own parent, or more than two transforms is
+  refused. The library does not pick a reading, and it does not pick the reading that happens to
+  verify. A response may carry several assertions, but each must be authenticated — by the signed
+  `Response` or by its own signature — before any is accepted, and they are recorded together.
   One case is not refused yet: a signature with more than one reference is ignored, so its element
   counts as unsigned. That matters only for a `Response` under `wantAuthnResponseSigned: false`,
   which is then accepted on the strength of its separately signed assertion. The next major version
@@ -1070,7 +1088,11 @@ your application started.
 - **What is remembered** is the verified assertion's ID together with its `Issuer`, so identity
   providers sharing a cache do not collide. It is remembered as soon as the assertion's signature
   verifies, before the other checks, so an assertion rejected as not yet valid cannot be presented
-  again once it is.
+  again once it is. A response with several assertions records all of them before accepting any,
+  and a rejection releases every record it took. A single assertion rejected inside its own time
+  window keeps its record, so it cannot be presented again once the window opens. Each assertion is
+  therefore consumed at most once, including across concurrent validations and processes that share
+  the cache.
 - **For how long:** until the last moment the assertion could still be accepted. That is the
   earlier of its `Conditions` `NotOnOrAfter` and the latest `NotOnOrAfter` among its
   `SubjectConfirmationData`, capped by `maxAssertionAgeMs`, plus `acceptedClockSkewMs`. An

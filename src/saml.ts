@@ -17,6 +17,7 @@ import {
 } from "./metadata";
 import { signAuthnRequestPost } from "./saml-post-signing";
 import {
+  AssertionSession,
   AudienceRestrictionXML,
   AuthOptions,
   AuthorizeRequestXML,
@@ -258,38 +259,235 @@ function assertionAcceptedUntilMs(
 
 class ReplayedAssertionError extends Error {}
 
+// A rejection on the assertion's own time window keeps the recorded ID: an assertion rejected as
+// not yet valid must not become replayable once its window opens.
+class AssertionTimeWindowError extends Error {}
+
+interface ParsedAssertion {
+  xml: string;
+  document: XMLOutput;
+  assertion: XMLOutput;
+  id: string | undefined;
+  issuer: string | undefined;
+  sessionIndexes: string[];
+}
+
+async function parseAssertionAsync(assertionXml: string): Promise<ParsedAssertion> {
+  const doc: XMLOutput = await parseXml2JsFromString(assertionXml);
+  const assertion: XMLOutput = doc.Assertion;
+  if (assertion == null) {
+    throw new Error("Cannot obtain assertion from signed data");
+  }
+
+  const sessionIndexes = ((assertion.AuthnStatement ?? []) as XMLOutput[])
+    .map((statement) => statement.$?.SessionIndex)
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const id = assertion.$?.ID;
+  const issuer = assertion.Issuer?.[0]?._;
+
+  return {
+    xml: assertionXml,
+    document: doc,
+    assertion,
+    id: typeof id === "string" ? id : undefined,
+    issuer: typeof issuer === "string" ? issuer : undefined,
+    sessionIndexes,
+  };
+}
+
+async function normalizeVerifiedAssertionXmlAsync(verifiedXml: string): Promise<string> {
+  const verifiedDoc = await parseDomFromString(verifiedXml);
+  if (verifiedDoc.documentElement.localName !== "Assertion") {
+    throw new Error("Cannot obtain assertion from signed data");
+  }
+  return verifiedDoc.documentElement.toString();
+}
+
 // SAML profiles §4.1.4.5: the SP remembers the ID of each assertion it accepts for as long as that
 // assertion would be valid. It is recorded before the checks that can still reject the assertion, so
 // one rejected as not yet valid cannot be presented again once it is.
 // https://docs.oasis-open.org/security/saml/v2.0/saml-profiles-2.0-os.pdf
-async function recordAssertionAsync(assertionXml: string, options: SamlOptions): Promise<void> {
-  const doc: XMLOutput = await parseXml2JsFromString(assertionXml);
-  const assertion: XMLOutput = doc.Assertion;
-  const id = assertion.$?.ID;
-  if (id == null) {
-    throw new Error("The assertion has no ID, so it cannot be checked for replay");
-  }
-  const acceptedUntilMs = assertionAcceptedUntilMs(
-    assertion,
-    options.maxAssertionAgeMs,
-    options.acceptedClockSkewMs,
-  );
-  if (acceptedUntilMs == null) {
-    throw new Error(
-      "The assertion has no NotOnOrAfter, so it would be accepted for ever and cannot be checked for replay",
+async function recordAssertionsAsync(
+  assertions: ParsedAssertion[],
+  options: SamlOptions,
+): Promise<string[]> {
+  const nowMs = new Date().getTime();
+  const records: { key: string; id: string; expiresAtMs: number }[] = [];
+  const keys = new Set<string>();
+
+  // Validate the whole set before writing, so a malformed later assertion cannot consume an earlier
+  // one. The response is accepted as one transaction or leaves no assertion ID behind.
+  for (const { assertion, id } of assertions) {
+    if (id == null) {
+      throw new Error("The assertion has no ID, so it cannot be checked for replay");
+    }
+    const expiresAtMs = assertionAcceptedUntilMs(
+      assertion,
+      options.maxAssertionAgeMs,
+      options.acceptedClockSkewMs,
     );
-  }
-  if (acceptedUntilMs <= new Date().getTime()) {
-    return; // already expired, which the checks that follow reject
+    if (expiresAtMs == null) {
+      throw new Error(
+        "The assertion has no NotOnOrAfter, so it would be accepted for ever and cannot be checked for replay",
+      );
+    }
+    if (expiresAtMs <= nowMs) {
+      return []; // already expired, which the checks that follow reject
+    }
+
+    // Kept apart from request IDs, which are stored as they are, and from other identity providers'.
+    const key = JSON.stringify(["assertion", assertion.Issuer?.[0]?._ ?? "", id]);
+    if (keys.has(key)) {
+      throw new ReplayedAssertionError(`The assertion ${id} has already been received`);
+    }
+    keys.add(key);
+    records.push({ key, id, expiresAtMs });
   }
 
-  // Kept apart from request IDs, which are stored as they are, and from other identity providers'.
-  const key = JSON.stringify(["assertion", assertion.Issuer?.[0]._ ?? "", id]);
   // The constructor refuses a cacheProvider without saveIfAbsentAsync while this option is on.
   const cacheProvider = options.cacheProvider as Required<Pick<CacheProvider, "saveIfAbsentAsync">>;
-  if (!(await cacheProvider.saveIfAbsentAsync(key, generateInstant(), acceptedUntilMs))) {
-    throw new ReplayedAssertionError(`The assertion ${id} has already been received`);
+  const recordedKeys: string[] = [];
+  try {
+    for (const { key, id, expiresAtMs } of records) {
+      if (!(await cacheProvider.saveIfAbsentAsync(key, generateInstant(), expiresAtMs))) {
+        throw new ReplayedAssertionError(`The assertion ${id} has already been received`);
+      }
+      recordedKeys.push(key);
+    }
+    return recordedKeys;
+  } catch (err) {
+    // The set is one transaction: if a later save fails, release what this attempt took.
+    for (const key of recordedKeys) {
+      await options.cacheProvider.removeAsync(key);
+    }
+    throw err;
   }
+}
+
+function createAssertionSession(parsed: ParsedAssertion, profile: Profile): AssertionSession {
+  const sessionIndexes = Object.freeze([...parsed.sessionIndexes]) as string[];
+  const assertion = parsed.assertion as Record<string, unknown>;
+  const parsedDocument = parsed.document as Record<string, unknown>;
+  const getAssertionXml = () => parsed.xml;
+  const getAssertion = () => parsedDocument;
+  const sessionProfile: Profile = { ...profile };
+  delete sessionProfile.sessions;
+  delete sessionProfile.assertions;
+  delete sessionProfile.assertionXmls;
+  delete sessionProfile.parsedAssertions;
+  delete sessionProfile.sessionIndexes;
+  delete sessionProfile.subjects;
+  delete sessionProfile.getAssertionsXml;
+  delete sessionProfile.getAssertions;
+
+  const session: AssertionSession = {
+    id: parsed.id,
+    assertionId: parsed.id,
+    assertionXml: parsed.xml,
+    xml: parsed.xml,
+    assertion,
+    parsed: parsedDocument,
+    issuer: parsed.issuer ?? profile.issuer,
+    inResponseTo: typeof profile.inResponseTo === "string" ? profile.inResponseTo : undefined,
+    subject: profile.nameID,
+    nameID: profile.nameID,
+    nameIDFormat: profile.nameIDFormat,
+    nameQualifier: profile.nameQualifier,
+    spNameQualifier: profile.spNameQualifier,
+    sessionIndex: parsed.sessionIndexes[0] ?? profile.sessionIndex,
+    sessionIndexes,
+    profile: sessionProfile,
+    getAssertionXml,
+    getAssertion,
+  };
+  return Object.freeze(session);
+}
+
+interface SessionSummary {
+  sessions: AssertionSession[];
+  assertions: AssertionSession[];
+  assertionXmls: string[];
+  parsedAssertions: Record<string, unknown>[];
+  sessionIndexes: string[];
+  subjects: string[];
+  getAssertionsXml(): string[];
+  getAssertions(): Record<string, unknown>[];
+}
+
+function createSessionSummary(sessions: AssertionSession[]): SessionSummary {
+  const sessionIndexes: string[] = [];
+  const subjects: string[] = [];
+  for (const session of sessions) {
+    if (session.sessionIndex != null && !sessionIndexes.includes(session.sessionIndex)) {
+      sessionIndexes.push(session.sessionIndex);
+    }
+    for (const sessionIndex of session.sessionIndexes) {
+      if (!sessionIndexes.includes(sessionIndex)) sessionIndexes.push(sessionIndex);
+    }
+    if (session.nameID != null && !subjects.includes(session.nameID)) {
+      subjects.push(session.nameID);
+    }
+  }
+
+  const sessionList = Object.freeze([...sessions]) as AssertionSession[];
+  const assertionXmls = Object.freeze(
+    sessions.map((session) => session.assertionXml),
+  ) as string[];
+  const parsedAssertions = Object.freeze(
+    sessions.map((session) => session.getAssertion()),
+  ) as Record<string, unknown>[];
+  return {
+    sessions: sessionList,
+    assertions: sessionList,
+    assertionXmls,
+    parsedAssertions,
+    sessionIndexes: Object.freeze(sessionIndexes) as string[],
+    subjects: Object.freeze(subjects) as string[],
+    getAssertionsXml: () => assertionXmls,
+    getAssertions: () => parsedAssertions,
+  };
+}
+
+// The assertions and their session identities are one frozen list on the profile and on the
+// validation result. For a single assertion they stay non-enumerable, so an existing caller that
+// compares the profile's own properties sees exactly the object it saw before.
+function defineSessionSummary(
+  target: object,
+  summary: SessionSummary,
+  enumerable: boolean,
+): void {
+  Object.defineProperties(target, {
+    sessionIndexes: { value: summary.sessionIndexes, enumerable, configurable: true },
+    sessions: { value: summary.sessions, enumerable, configurable: true },
+    assertions: { value: summary.assertions, enumerable, configurable: true },
+    assertionXmls: { value: summary.assertionXmls, enumerable, configurable: true },
+    parsedAssertions: { value: summary.parsedAssertions, enumerable, configurable: true },
+    subjects: { value: summary.subjects, enumerable, configurable: true },
+    getAssertionsXml: { value: summary.getAssertionsXml, enumerable, configurable: true },
+    getAssertions: { value: summary.getAssertions, enumerable, configurable: true },
+  });
+}
+
+function collectSessionIndexes(user: Profile): string[] {
+  const sessionIndexes: string[] = [];
+  const add = (value: unknown) => {
+    if (typeof value === "string" && value.length > 0 && !sessionIndexes.includes(value)) {
+      sessionIndexes.push(value);
+    }
+  };
+
+  add(user.sessionIndex);
+  const sessions = user.sessions ?? user.assertions;
+  if (sessions == null) {
+    for (const sessionIndex of user.sessionIndexes ?? []) add(sessionIndex);
+  }
+  for (const session of sessions ?? []) {
+    // A LogoutRequest carries one NameID, so it can only end sessions that belong to it.
+    if (user.nameID != null && session.nameID != null && session.nameID !== user.nameID) continue;
+    add(session.sessionIndex);
+    for (const sessionIndex of session.sessionIndexes ?? []) add(sessionIndex);
+  }
+  return sessionIndexes;
 }
 
 const inflateRawAsync = util.promisify(zlib.inflateRaw);
@@ -830,11 +1028,19 @@ class SAML {
       request["samlp:LogoutRequest"]["saml:NameID"]["@SPNameQualifier"] = user.spNameQualifier;
     }
 
-    if (user.sessionIndex) {
+    const sessionIndexes = collectSessionIndexes(user);
+    if (sessionIndexes.length === 1) {
       request["samlp:LogoutRequest"]["saml2p:SessionIndex"] = {
         "@xmlns:saml2p": "urn:oasis:names:tc:SAML:2.0:protocol",
-        "#text": user.sessionIndex,
+        "#text": sessionIndexes[0],
       };
+    } else if (sessionIndexes.length > 1) {
+      request["samlp:LogoutRequest"]["saml2p:SessionIndex"] = sessionIndexes.map(
+        (sessionIndex): XMLObject => ({
+          "@xmlns:saml2p": "urn:oasis:names:tc:SAML:2.0:protocol",
+          "#text": sessionIndex,
+        }),
+      );
     }
 
     await this.cacheProvider.saveAsync(id, instant);
@@ -1203,13 +1409,23 @@ class SAML {
 
   async validatePostResponseAsync(
     container: Record<string, string>,
-  ): Promise<{ profile: Profile | null; loggedOut: boolean }> {
+  ): Promise<{
+    profile: Profile | null;
+    loggedOut: boolean;
+    sessions?: AssertionSession[];
+    assertions?: AssertionSession[];
+    sessionIndexes?: string[];
+    subjects?: string[];
+  }> {
     let xml: string;
     let doc: Document;
     let inResponseTo: string | null = null;
     let verifiedInResponseTo: string | null = null;
     let verifiedDestination: string | null = null;
-    let verifiedAssertionXml: string | null = null;
+    let responseCarriedMultipleAssertions = false;
+    let legacyVerifiedXml: string | null = null;
+    const verifiedAssertionXmls: string[] = [];
+    const recordedAssertionKeys: string[] = [];
 
     try {
       xml = Buffer.from(container.SAMLResponse, "base64").toString("utf8");
@@ -1230,12 +1446,12 @@ class SAML {
       let validSignature = false; // Use `getVerifiedXml()` to collect the actual verified contents
 
       const responseVerifiedXml = getVerifiedXml(xml, doc.documentElement, pemFiles);
-      let assertionVerifiedXml = null;
-      let decryptedAssertionVerifiedXml = null;
+      let verifiedDom: Document | null = null;
 
       if (responseVerifiedXml) {
         validSignature = true;
-        const verifiedDom = await parseDomFromString(responseVerifiedXml);
+        legacyVerifiedXml = responseVerifiedXml;
+        verifiedDom = await parseDomFromString(responseVerifiedXml);
         verifiedInResponseTo = getRootAttribute(verifiedDom, "InResponseTo");
         verifiedDestination = getRootAttribute(verifiedDom, "Destination");
         assertOneIssuer(
@@ -1257,88 +1473,154 @@ class SAML {
         throw new Error("Invalid document signature");
       }
 
+      // A signed Response covers the assertions inside its verified bytes. When it is not signed,
+      // each assertion has to be verified on its own, and those verified bytes are what is processed.
+      const assertionsDoc = verifiedDom ?? doc;
       const assertions = xpath.selectElements(
+        assertionsDoc,
+        "/*[local-name()='Response']/*[local-name()='Assertion']",
+      );
+      const assertionsAsReceived = xpath.selectElements(
         doc,
         "/*[local-name()='Response']/*[local-name()='Assertion']",
       );
       const encryptedAssertions = xpath.selectElements(
-        doc,
+        assertionsDoc,
         "/*[local-name()='Response']/*[local-name()='EncryptedAssertion']",
       );
+      const assertionCount = assertions.length + encryptedAssertions.length;
+      responseCarriedMultipleAssertions = assertionCount > 1;
 
-      if (assertions.length + encryptedAssertions.length > 1) {
-        // There's no reason I know of that we want to handle multiple assertions, and it seems like a
-        //   potential risk vector for signature scope issues, so treat this as an invalid signature
+      // Preserve the specific error this version has always given a Response with more than one
+      // assertion when nothing covers an unsigned one. Every assertion has to authenticate itself
+      // before a multi-assertion Response can be considered.
+      if (
+        !validSignature &&
+        encryptedAssertions.length === 0 &&
+        assertions.length > 1 &&
+        assertions.some(
+          (assertion) =>
+            xpath.selectElements(
+              assertion,
+              "./*[local-name()='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']",
+            ).length === 0,
+        )
+      ) {
         throw new Error("Invalid signature: multiple assertions");
       }
 
-      if (assertions.length == 1) {
-        if (this.options.wantAssertionsSigned || !validSignature) {
-          assertionVerifiedXml = getVerifiedXml(xml, assertions[0], pemFiles);
+      for (const [index, assertion] of assertions.entries()) {
+        if (responseVerifiedXml) {
+          if (this.options.wantAssertionsSigned) {
+            const assertionAsReceived = assertionsAsReceived[index];
+            if (assertionAsReceived == null) {
+              throw new Error("Cannot obtain assertion from signed data");
+            }
+            const assertionVerifiedXml = getVerifiedXml(xml, assertionAsReceived, pemFiles);
+            if (!assertionVerifiedXml) {
+              throw new Error("Invalid signature");
+            }
+          }
+          verifiedAssertionXmls.push(assertion.toString());
+        } else {
+          const assertionVerifiedXml = getVerifiedXml(xml, assertion, pemFiles);
           if (!assertionVerifiedXml) {
             throw new Error("Invalid signature");
           }
+          verifiedAssertionXmls.push(
+            await normalizeVerifiedAssertionXmlAsync(assertionVerifiedXml),
+          );
+          if (assertionCount === 1) legacyVerifiedXml = assertionVerifiedXml;
         }
       }
 
-      if (encryptedAssertions.length == 1) {
+      if (encryptedAssertions.length > 0) {
         assertRequired(this.options.decryptionPvk, "No decryption key for encrypted SAML response");
 
-        const encryptedAssertionXml = encryptedAssertions[0].toString();
+        for (const encryptedAssertion of encryptedAssertions) {
+          const encryptedAssertionXml = encryptedAssertion.toString();
 
-        const decryptedXml = await decryptXml(encryptedAssertionXml, this.options.decryptionPvk);
-        warnIfDecryptionWillFailInNextMajor(encryptedAssertions[0]);
-        const decryptedDoc = await parseDomFromString(decryptedXml);
-        const decryptedAssertions = xpath.selectElements(
-          decryptedDoc,
-          "/*[local-name()='Assertion']",
-        );
-        if (decryptedAssertions.length != 1) throw new Error("Invalid EncryptedAssertion content");
-
-        if (this.options.wantAssertionsSigned || !validSignature) {
-          decryptedAssertionVerifiedXml = getVerifiedXml(
-            decryptedXml,
-            decryptedAssertions[0],
-            pemFiles,
+          const decryptedXml = await decryptXml(encryptedAssertionXml, this.options.decryptionPvk);
+          warnIfDecryptionWillFailInNextMajor(encryptedAssertion);
+          const decryptedDoc = await parseDomFromString(decryptedXml);
+          const decryptedAssertions = xpath.selectElements(
+            decryptedDoc,
+            "/*[local-name()='Assertion']",
           );
-          if (decryptedAssertionVerifiedXml == null) {
-            throw new Error("Invalid signature from encrypted assertion");
+          if (decryptedAssertions.length != 1)
+            throw new Error("Invalid EncryptedAssertion content");
+
+          let decryptedAssertionVerifiedXml: string | null = null;
+          if (this.options.wantAssertionsSigned || !validSignature) {
+            decryptedAssertionVerifiedXml = getVerifiedXml(
+              decryptedXml,
+              decryptedAssertions[0],
+              pemFiles,
+            );
+            if (decryptedAssertionVerifiedXml == null) {
+              throw new Error("Invalid signature from encrypted assertion");
+            }
+          }
+          verifiedAssertionXmls.push(
+            !validSignature && decryptedAssertionVerifiedXml != null
+              ? await normalizeVerifiedAssertionXmlAsync(decryptedAssertionVerifiedXml)
+              : decryptedAssertions[0].toString(),
+          );
+          if (assertionCount === 1 && decryptedAssertionVerifiedXml != null) {
+            legacyVerifiedXml = decryptedAssertionVerifiedXml;
           }
         }
       }
 
-      // If there's no assertion, fall back on xml2js response parsing for the status &
-      //   LogoutResponse code.
-      // collect the verified XML's
-      const verifiedXml =
-        responseVerifiedXml || assertionVerifiedXml || decryptedAssertionVerifiedXml;
-
-      // double check that there is at least 1 assertion
-      if (verifiedXml && assertions.length + encryptedAssertions.length == 1) {
-        const signedAssertion = await this.getSignedAssertion(verifiedXml);
-
+      if (verifiedAssertionXmls.length === 1 && legacyVerifiedXml != null) {
+        const signedAssertion = await this.getSignedAssertion(legacyVerifiedXml);
         if (signedAssertion == null) {
           throw new Error("Cannot obtain assertion from signed data");
         }
-        verifiedAssertionXml = signedAssertion;
-        if (this.options.rejectReplayedAssertions) {
-          await recordAssertionAsync(signedAssertion, this.options);
-        }
-        const result = await this.processValidlySignedAssertionAsync(
-          signedAssertion,
-          xml,
-          responseVerifiedXml ? verifiedInResponseTo : inResponseTo,
-          responseVerifiedXml != null,
+        verifiedAssertionXmls[0] = signedAssertion;
+      }
+
+      if (verifiedAssertionXmls.length > 0) {
+        const parsedAssertions = await Promise.all(
+          verifiedAssertionXmls.map((assertionXml) => parseAssertionAsync(assertionXml)),
         );
+        if (this.options.rejectReplayedAssertions) {
+          recordedAssertionKeys.push(
+            ...(await recordAssertionsAsync(parsedAssertions, this.options)),
+          );
+        }
+
+        const profiles: Profile[] = [];
+        for (const assertionXml of verifiedAssertionXmls) {
+          const result = await this.processValidlySignedAssertionAsync(
+            assertionXml,
+            xml,
+            responseVerifiedXml ? verifiedInResponseTo : inResponseTo,
+            responseVerifiedXml != null,
+          );
+          profiles.push(result.profile);
+        }
+        const sessions = parsedAssertions.map((parsed, index) =>
+          createAssertionSession(parsed, profiles[index]),
+        );
+        const sessionSummary = createSessionSummary(sessions);
+        defineSessionSummary(profiles[0], sessionSummary, sessions.length > 1);
+
         // Consumed here, not in the overridable method, whose inResponseToIsVerified an override
         // written before that parameter drops. Unless the Response is signed, only the assertion
         // can name the request it answers.
         if (this.mustValidateInResponseTo(Boolean(inResponseTo))) {
-          const answeredRequestId = responseVerifiedXml
-            ? verifiedInResponseTo
-            : (await getSubjectInResponseTosAsync(signedAssertion)).find(
+          let answeredRequestId: string | undefined;
+          if (responseVerifiedXml) {
+            answeredRequestId = verifiedInResponseTo ?? undefined;
+          } else {
+            for (const assertionXml of verifiedAssertionXmls) {
+              answeredRequestId = (await getSubjectInResponseTosAsync(assertionXml)).find(
                 (subjectInResponseTo) => subjectInResponseTo === inResponseTo,
               );
+              if (answeredRequestId != null) break;
+            }
+          }
           await consumeInResponseToAsync(this.cacheProvider, answeredRequestId ?? null);
         }
         // An unsigned Response's Destination is not verified, so it is not read.
@@ -1350,6 +1632,15 @@ class SAML {
             verifiedDestination,
           );
         }
+        const result: {
+          profile: Profile;
+          loggedOut: boolean;
+          sessions?: AssertionSession[];
+          assertions?: AssertionSession[];
+          sessionIndexes?: string[];
+          subjects?: string[];
+        } = { profile: profiles[0], loggedOut: false };
+        defineSessionSummary(result, sessionSummary, sessions.length > 1);
         return result;
       }
 
@@ -1433,19 +1724,33 @@ class SAML {
       }
     } catch (err) {
       debugLog.enabled && debugLog("validatePostResponse resulted in an error: %s", err);
+      // A response is accepted whole or not at all. Release only the assertion IDs this attempt
+      // recorded, so a partially valid response cannot consume an identity the IdP will resend.
+      if (
+        recordedAssertionKeys.length > 0 &&
+        (!(err instanceof AssertionTimeWindowError) || responseCarriedMultipleAssertions)
+      ) {
+        for (const key of recordedAssertionKeys) {
+          await this.cacheProvider.removeAsync(key);
+        }
+      }
       // A failure the IdP signed means it answered the request, so no other response is coming.
       // An unsigned one proves nothing about the request it names, so that request stays pending.
       // Gated as success is, so under "ifPresent" a failure retires nothing a success would keep.
       // A replay leaves its requests to the first copy, which may still be validating.
+      // A multi-assertion Response is one transaction: until every assertion validates, it leaves
+      // the request pending for a replacement response.
       if (
         !(err instanceof ReplayedAssertionError) &&
+        !responseCarriedMultipleAssertions &&
         this.mustValidateInResponseTo(Boolean(inResponseTo))
       ) {
-        const answeredRequestIds = new Set(
-          verifiedAssertionXml == null
-            ? []
-            : await getSubjectInResponseTosAsync(verifiedAssertionXml),
-        );
+        const answeredRequestIds = new Set<string>();
+        for (const assertionXml of verifiedAssertionXmls) {
+          for (const requestId of await getSubjectInResponseTosAsync(assertionXml)) {
+            answeredRequestIds.add(requestId);
+          }
+        }
         if (verifiedInResponseTo != null) {
           answeredRequestIds.add(verifiedInResponseTo);
         }
@@ -2015,16 +2320,16 @@ class SAML {
     if (notBefore) {
       const notBeforeMs = dateStringToTimestamp(notBefore, "NotBefore");
       if (nowMs + this.options.acceptedClockSkewMs < notBeforeMs)
-        return new Error("SAML assertion not yet valid");
+        return new AssertionTimeWindowError("SAML assertion not yet valid");
     }
     if (notOnOrAfter) {
       const notOnOrAfterMs = dateStringToTimestamp(notOnOrAfter, "NotOnOrAfter");
       if (nowMs - this.options.acceptedClockSkewMs >= notOnOrAfterMs)
-        return new Error("SAML assertion expired: clocks skewed too much");
+        return new AssertionTimeWindowError("SAML assertion expired: clocks skewed too much");
     }
     if (maxTimeLimitMs != null) {
       if (nowMs - this.options.acceptedClockSkewMs >= maxTimeLimitMs)
-        return new Error("SAML assertion expired: assertion too old");
+        return new AssertionTimeWindowError("SAML assertion expired: assertion too old");
     }
 
     return null;

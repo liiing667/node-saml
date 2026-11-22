@@ -48,6 +48,46 @@ export interface CacheProvider {
   saveIfAbsentAsync?(key: string, value: string, expiresAtMs: number): Promise<boolean>;
 }
 
+/**
+ * One assertion accepted from a SAML `Response`, together with the subject and session identity
+ * that assertion established. Every value here comes from the verified assertion XML.
+ */
+export interface AssertionSession {
+  /** The `Assertion`'s `ID`, when it has one. */
+  id?: string;
+  /** Alias of `id`, for callers that name the assertion rather than the session. */
+  assertionId?: string;
+  /** The assertion XML the signature covered. Treat only this copy as authenticated. */
+  assertionXml: string;
+  /** Alias of `assertionXml`. */
+  xml: string;
+  /** The same verified assertion parsed into a JavaScript object. */
+  assertion: Record<string, unknown>;
+  /** The verified assertion document parsed as a JavaScript object, as `getAssertion()` returns. */
+  parsed: Record<string, unknown>;
+  /** The assertion's `Issuer`. */
+  issuer?: string;
+  /** The request ID a signature covers for this assertion, when there is one. */
+  inResponseTo?: string;
+  /** The subject's `NameID` value. */
+  subject?: string;
+  /** The subject's `NameID` value, as named in `Profile`. */
+  nameID?: string;
+  nameIDFormat?: string;
+  nameQualifier?: string;
+  spNameQualifier?: string;
+  /** The first `SessionIndex` in this assertion, if it has one. */
+  sessionIndex?: string;
+  /** Every `SessionIndex` in this assertion, in document order. */
+  sessionIndexes: string[];
+  /** The profile built from this assertion alone, with the same fields as a single-assertion login. */
+  profile: Profile;
+  /** The verified assertion XML. */
+  getAssertionXml(): string;
+  /** The verified assertion parsed as a JavaScript object. */
+  getAssertion(): Record<string, unknown>;
+}
+
 export type XMLValue = string | number | boolean | null | XMLObject | XMLValue[];
 
 export type XMLObject = {
@@ -429,6 +469,21 @@ export type SamlConfig = Partial<SamlOptions> & MandatorySamlOptions;
 export interface Profile {
   issuer: string;
   sessionIndex?: string;
+  /**
+   * Every `SessionIndex` in the accepted `Response`, in assertion order. `sessionIndex` remains the
+   * first one for compatibility. Each IdP session in this list must be terminated at logout.
+   */
+  sessionIndexes?: string[];
+  /** The assertions accepted from the `Response`, one entry per assertion, in response order. */
+  assertions?: AssertionSession[];
+  /** Alias of `assertions`, naming the same list as sessions. */
+  sessions?: AssertionSession[];
+  /** The verified XML of each accepted assertion, in response order. */
+  assertionXmls?: string[];
+  /** The parsed form of each accepted assertion, in response order. */
+  parsedAssertions?: Record<string, unknown>[];
+  /** The verified `NameID` values from the accepted assertions, without duplicates. */
+  subjects?: string[];
   nameID: string;
   nameIDFormat: string;
   nameQualifier?: string;
@@ -439,6 +494,10 @@ export interface Profile {
   ["urn:oid:0.9.2342.19200300.100.1.3"]?: string;
   getAssertionXml?(): string; // get the assertion XML, taken from the verified content
   getAssertion?(): Record<string, unknown>; // get the verified assertion XML parsed as a JavaScript object
+  /** The verified XML of every assertion in the `Response`, in assertion order. */
+  getAssertionsXml?(): string[];
+  /** Every verified assertion in the `Response`, parsed as a JavaScript object. */
+  getAssertions?(): Record<string, unknown>[];
   /**
    * Returns the SAML response as received. It may contain material that was not covered by the
    * signature used to authenticate the assertion, and it does not say which part was. Do not

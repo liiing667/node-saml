@@ -2,6 +2,7 @@ import { SAML } from "./saml";
 import { generateServiceProviderMetadata } from "./metadata";
 import { CacheProviderOptions, InMemoryCacheProvider } from "./in-memory-cache-provider";
 import {
+  AssertionSession,
   AudienceRestrictionXML,
   CacheItem,
   CacheProvider,
@@ -29,6 +30,7 @@ import {
 
 export {
   SAML,
+  AssertionSession,
   generateServiceProviderMetadata,
   GenerateServiceProviderMetadataParams,
   CacheItem,
