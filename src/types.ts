@@ -34,6 +34,17 @@ export interface CacheProvider {
   getAsync(key: string): Promise<string | null>;
   removeAsync(key: string | null): Promise<string | null>;
   /**
+   * Replaces the value stored under `key`, atomically, without extending its expiry. Resolves
+   * `false` if the key is absent. Logout transactions use it to publish a state transition only
+   * after the previous state has been read.
+   */
+  updateAsync?(key: string, value: string): Promise<boolean>;
+  /**
+   * Replaces the value stored under `key` only if it is still `expectedValue`, atomically.
+   * `null` names an absent key. Resolves whether the value was replaced.
+   */
+  compareAndSwapAsync?(key: string, expectedValue: string | null, value: string): Promise<boolean>;
+  /**
    * Removes `key` and returns its value, or `null` if it was absent, as one atomic operation.
    * When present, it is used to consume request IDs, so that of two concurrent copies of a
    * response only one is accepted.
@@ -459,4 +470,100 @@ export class SamlStatusError extends Error {
   ) {
     super(message);
   }
+}
+
+export type LogoutState = "pending" | "terminated" | "failed";
+
+export type LogoutTerminationResult = "terminated" | "not-terminated";
+
+export type LogoutResponseResult = "none" | "success" | "failure" | "replay";
+
+export type LogoutStage =
+  | "initiated"
+  | "request-url"
+  | "response-signature"
+  | "response-status"
+  | "response-issuer"
+  | "response-in-response-to"
+  | "login-generation"
+  | "response-validation"
+  | "committed"
+  | "recovered"
+  | "legacy";
+
+export interface LogoutFailure {
+  stage: LogoutStage;
+  message: string;
+  location: string;
+}
+
+/**
+ * The durable record of one SP-initiated logout transaction. It names the request that was
+ * issued and the local session generation it terminates, so a retry or a later process can tell
+ * a completed logout from a session that must not be used again.
+ *
+ * `state` tracks the identity provider's side of the exchange; `terminationResult` is the local
+ * decision that was committed when the request was created and is authoritative for the session.
+ */
+export interface LogoutReport {
+  version: 1;
+  kind: "logout";
+  requestId: string;
+  requestIssueInstant: string;
+  sessionGeneration: number;
+  sessionIndex: string | null;
+  nameID: string;
+  nameIDFormat: string | null;
+  nameQualifier: string | null;
+  spNameQualifier: string | null;
+  state: LogoutState;
+  terminationResult: LogoutTerminationResult;
+  responseResult: LogoutResponseResult;
+  stage: LogoutStage;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  failure?: LogoutFailure;
+}
+
+/** The cache record that stores a logout transaction under the session identity. */
+export interface LogoutSessionState extends Omit<LogoutReport, "kind"> {
+  kind: "logout-session";
+}
+
+/** The URL to send the user to and the durable report created with it. */
+export interface LogoutResult {
+  url: string;
+  report: LogoutReport;
+}
+
+/** An error thrown while a logout transaction was being created. */
+export class LogoutError extends Error {
+  /** The same report as `report`, under the name validation errors use. */
+  public readonly logoutReport: LogoutReport;
+
+  constructor(
+    message: string,
+    public readonly report: LogoutReport,
+  ) {
+    super(message);
+    this.name = "LogoutError";
+    this.logoutReport = report;
+  }
+}
+
+/** A login assertion tried to use a session that a logout transaction already terminated. */
+export class LogoutSessionTerminatedError extends LogoutError {
+  constructor(message: string, report: LogoutReport) {
+    super(message, report);
+    this.name = "LogoutSessionTerminatedError";
+  }
+}
+
+/**
+ * An error thrown while a logout transaction was found. `logoutReport` is the durable report at
+ * the moment of rejection, including the stage that failed.
+ */
+export interface LogoutReportedError extends Error {
+  logoutReport?: LogoutReport;
 }

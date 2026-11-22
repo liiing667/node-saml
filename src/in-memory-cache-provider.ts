@@ -114,6 +114,49 @@ export class InMemoryCacheProvider implements CacheProvider {
   }
 
   /**
+   * Replaces an existing value without extending its expiry. Returns whether the key existed.
+   */
+  async updateAsync(key: string, value: string): Promise<boolean> {
+    this.prune();
+
+    const nowMs = new Date().getTime();
+    await this.removeKeyIfExpired(key, nowMs);
+
+    const item = this.cacheKeys[key];
+    if (item == null) {
+      return false;
+    }
+    this.cacheKeys[key] = { ...item, value };
+    return true;
+  }
+
+  /**
+   * Replaces a value only when it is still the one the caller read. An absent key is `null`.
+   */
+  async compareAndSwapAsync(
+    key: string,
+    expectedValue: string | null,
+    value: string,
+  ): Promise<boolean> {
+    this.prune();
+
+    const nowMs = new Date().getTime();
+    await this.removeKeyIfExpired(key, nowMs);
+
+    const item = this.cacheKeys[key];
+    const currentValue = item == null ? null : item.value;
+    if (currentValue !== expectedValue) {
+      return false;
+    }
+    if (item == null) {
+      this.cacheKeys[key] = { createdAt: nowMs, value };
+    } else {
+      this.cacheKeys[key] = { ...item, value };
+    }
+    return true;
+  }
+
+  /**
    * Stores an item under a key that is absent or expired, and keeps it until `expiresAtMs`.
    * Returns whether it stored the item.
    */

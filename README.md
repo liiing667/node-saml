@@ -108,9 +108,11 @@ exported from the package root, and so is every other type the package's API use
 `CacheProvider`, `CacheItem`, `InMemoryCacheProvider` and its `CacheProviderOptions`,
 `ValidateInResponseTo`, `RacComparison`, `SignatureAlgorithm`, `SamlSigningOptions`,
 `SamlScopingConfig`, `SamlIDPListConfig`, `SamlIDPEntryConfig`, `IdpCertCallback`, `AuthOptions`,
-`MandatorySamlOptions`, `SamlStatusError`, `GenerateServiceProviderMetadataParams`, and the XML types
-that `SAML`'s protected methods use: `XMLOutput`, `XmlJsObject`, `AudienceRestrictionXML`,
-`XMLObject`, and `XMLValue`.
+`MandatorySamlOptions`, `SamlStatusError`, `LogoutError`, `LogoutSessionTerminatedError`,
+`LogoutReportedError`, `LogoutReport`, `LogoutResult`, `LogoutSessionState`, `LogoutState`,
+`LogoutTerminationResult`, `LogoutResponseResult`, `LogoutStage`, `LogoutFailure`,
+`GenerateServiceProviderMetadataParams`, and the XML types that `SAML`'s protected methods use:
+`XMLOutput`, `XmlJsObject`, `AudienceRestrictionXML`, `XMLObject`, and `XMLValue`.
 
 Import from the package root only. The compiled modules under `lib/` are internal: nothing there is
 part of the API unless the root exports it. The next major version closes that path, so a deep
@@ -316,6 +318,72 @@ res.redirect(url);
 
 `getLogoutResponseUrl(profile, relayState, options, success, callback)` is the callback-style
 equivalent of `getLogoutResponseUrlAsync`.
+
+#### Logout transactions and local session termination
+
+An SP-initiated logout is a transaction, not a URL that is rebuilt from scratch on every attempt.
+Creating the `LogoutRequest` freezes the `NameID`, the `SessionIndex` (the session identity), the
+request ID and a session generation in the `cacheProvider`, and records the local session as
+terminated. That choice is deliberate: a local session is revoked even when the identity provider
+is unreachable. The trade-off is that the identity provider's session can outlive the local one
+until the remote logout succeeds; waiting for the identity provider instead keeps a stolen local
+session usable for the whole round trip.
+
+```javascript
+const { url, report } = await saml.beginLogoutAsync(profile, relayState, options);
+// report.requestId, report.sessionGeneration, report.terminationResult
+if (report.terminationResult === "terminated") {
+  // Clear the application's session and cookie in the same step. Node-SAML records the decision,
+  // but the application owns the cookie.
+  req.logout();
+}
+res.redirect(url);
+```
+
+`getLogoutUrlAsync` keeps its existing string result and uses the same transaction. `beginLogoutAsync`
+returns the report alongside the URL. If the identity provider answers with a failure, or the answer
+is lost, a retry reuses the same request ID and session generation; it cannot turn the terminated
+session back into an active one. After a successful answer a retry starts a new request in a new
+generation, because the completed request ID has already been consumed and a login issued before
+the retry must not become current again.
+
+The report survives the process that created it when the cache is shared:
+
+```javascript
+const report = await saml.getLogoutReportAsync(profile); // or a request ID
+const recovered = await saml.recoverLogoutSessionAsync(profile);
+```
+
+`recoverLogoutSessionAsync` returns either no transaction (the complete pre-logout state) or the
+transaction with `terminationResult: "terminated"`. It never returns a half-applied logout. The
+report also carries `responseResult`, `stage`, and, on failure, a `failure` object naming the exact
+stage (`response-status`, `response-issuer`, `response-in-response-to`, `response-signature`,
+`request-url`, or `login-generation`) and the source location that rejected the message.
+
+The fields a consumer normally reads are `requestId`, `sessionGeneration`, `terminationResult`,
+`responseResult`, `stage`, and, when a message was rejected, `failure`. They are stable across a
+retry that reuses the request and across a process that reads the same cache entry.
+
+Run the recovery read on the first request after a restart, before accepting the cookie as a
+session. If it reports `terminationResult: "terminated"`, clear the cookie even though the identity
+provider's answer never arrived; that is what keeps the browser cookie and the durable local state
+from diverging.
+
+Errors from `beginLogoutAsync` and from response validation carry the same report as a `logoutReport`
+property when a transaction was found, so a failed redirect or a rejected `LogoutResponse` can still
+contribute its `terminationResult` to that decision.
+
+The generation is shared with login requests. A login assertion issued before the logout has an
+older generation and is rejected with `LogoutSessionTerminatedError`, even after a restart, so an
+assertion captured before logout cannot establish a new session. A login request issued after the
+logout has the same generation and is accepted. This check uses `SessionIndex`; a logout and login
+that carry no `SessionIndex` remain anonymous and are not tied to a durable session identity.
+
+Use a shared cache provider, such as Redis or a database, when processes can restart or several
+servers handle the logout callback. `InMemoryCacheProvider` shares the state only within one
+process, as described under [Cache provider](#cache-provider). Entries written by an older version
+hold only an `IssueInstant`; they remain readable and are reported with `stage: "legacy"` and
+generation `0`.
 
 `validatePostRequestAsync` also accepts a deprecated second argument, an object of injected
 dependencies — `_parseDomFromString`, `_parseXml2JsFromString` and `_validateSignature`. It is
@@ -1106,12 +1174,21 @@ interface CacheProvider {
   getAsync(key: string): Promise<string | null>;
   /** Removes an item from the cache if the key exists. */
   removeAsync(key: string | null): Promise<string | null>;
+  /** Optional. Replaces an existing value atomically without extending its expiry. */
+  updateAsync?(key: string, value: string): Promise<boolean>;
+  /** Optional. Replaces a value only if it is still `expectedValue`; `null` means absent. */
+  compareAndSwapAsync?(key: string, expectedValue: string | null, value: string): Promise<boolean>;
   /** Optional. Removes the key and returns its value, or null if it was absent, atomically. */
   consumeAsync?(key: string): Promise<string | null>;
   /** Needed by rejectReplayedAssertions. Saves the key until expiresAtMs, if absent, atomically. */
   saveIfAbsentAsync?(key: string, value: string, expiresAtMs: number): Promise<boolean>;
 }
 ```
+
+Implement `updateAsync` with your store's in-place update and `compareAndSwapAsync` with its
+compare-and-set operation. Node-SAML uses them to publish logout session generations atomically; a
+provider without them still works by reading and writing the whole record, but concurrent logout
+callbacks then have no single-step compare boundary.
 
 Implement `consumeAsync` with your store's single-step remove-and-return, such as Redis `GETDEL` or
 SQL `DELETE … RETURNING`. Node-SAML consumes request IDs with it, so of two copies of one response

@@ -23,6 +23,14 @@ import {
   CacheProvider,
   IdpCertCallback,
   isValidSamlSigningOptions,
+  LogoutError,
+  LogoutFailure,
+  LogoutReport,
+  LogoutResponseResult,
+  LogoutResult,
+  LogoutSessionState,
+  LogoutSessionTerminatedError,
+  LogoutStage,
   LogoutRequestXML,
   Profile,
   SamlConfig,
@@ -122,6 +130,337 @@ async function consumeInResponseToAsync(
   if (inResponseTo != null && (await consumeRequestIdAsync(cacheProvider, inResponseTo)) == null) {
     throw new Error("InResponseTo is not valid");
   }
+}
+
+function logoutGenerationKey(issuer: string): string {
+  return JSON.stringify(["node-saml", "logout-generation", issuer]);
+}
+
+function loginGenerationKey(issuer: string, requestId: string): string {
+  return JSON.stringify(["node-saml", "login-generation", issuer, requestId]);
+}
+
+function logoutReportKey(issuer: string, requestId: string): string {
+  return JSON.stringify(["node-saml", "logout-report", issuer, requestId]);
+}
+
+interface LogoutIdentity {
+  nameID?: string | null;
+  nameIDFormat?: string | null;
+  nameQualifier?: string | null;
+  spNameQualifier?: string | null;
+  sessionIndex?: string | null;
+}
+
+function logoutSessionKey(issuer: string, user: LogoutIdentity): string {
+  return JSON.stringify([
+    "node-saml",
+    "logout-session",
+    issuer,
+    user.nameID ?? null,
+    user.nameIDFormat ?? null,
+    user.nameQualifier ?? null,
+    user.spNameQualifier ?? null,
+    user.sessionIndex ?? null,
+  ]);
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> | null {
+  if (value == null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed != null && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseGeneration(value: string | null): number {
+  if (value == null || !/^\d+$/.test(value)) {
+    return 0;
+  }
+  const generation = Number(value);
+  return Number.isSafeInteger(generation) ? generation : 0;
+}
+
+function parseLoginGeneration(value: string | null): number | null {
+  if (value == null || !/^\d+$/.test(value)) {
+    return null;
+  }
+  const generation = Number(value);
+  return Number.isSafeInteger(generation) ? generation : null;
+}
+
+function isLogoutStage(value: unknown): value is LogoutStage {
+  return (
+    typeof value === "string" &&
+    [
+      "initiated",
+      "request-url",
+      "response-signature",
+      "response-status",
+      "response-issuer",
+      "response-in-response-to",
+      "login-generation",
+      "response-validation",
+      "committed",
+      "recovered",
+      "legacy",
+    ].includes(value)
+  );
+}
+
+function parseLogoutFailure(value: unknown): LogoutFailure | undefined {
+  if (value == null || typeof value !== "object") {
+    return undefined;
+  }
+  const failure = value as Partial<LogoutFailure>;
+  if (
+    !isLogoutStage(failure.stage) ||
+    typeof failure.message !== "string" ||
+    typeof failure.location !== "string"
+  ) {
+    return undefined;
+  }
+  return { stage: failure.stage, message: failure.message, location: failure.location };
+}
+
+function parseLogoutRecord(value: string | null): LogoutReport | null {
+  const record = parseJsonObject(value);
+  if (record == null || record.version !== 1) {
+    return null;
+  }
+  if (record.kind !== "logout" && record.kind !== "logout-session") {
+    return null;
+  }
+  const requestId = record.requestId;
+  const requestIssueInstant = record.requestIssueInstant;
+  const sessionGeneration = record.sessionGeneration;
+  const nameID = record.nameID;
+  const state = record.state;
+  const terminationResult = record.terminationResult;
+  const responseResult = record.responseResult;
+  const stage = record.stage;
+  if (
+    typeof requestId !== "string" ||
+    typeof requestIssueInstant !== "string" ||
+    typeof sessionGeneration !== "number" ||
+    typeof nameID !== "string" ||
+    (state !== "pending" && state !== "terminated" && state !== "failed") ||
+    (terminationResult !== "terminated" && terminationResult !== "not-terminated") ||
+    (responseResult !== "none" &&
+      responseResult !== "success" &&
+      responseResult !== "failure" &&
+      responseResult !== "replay") ||
+    !isLogoutStage(stage)
+  ) {
+    return null;
+  }
+  return {
+    version: 1,
+    kind: "logout",
+    requestId,
+    requestIssueInstant,
+    sessionGeneration,
+    sessionIndex: typeof record.sessionIndex === "string" ? record.sessionIndex : null,
+    nameID,
+    nameIDFormat: typeof record.nameIDFormat === "string" ? record.nameIDFormat : null,
+    nameQualifier: typeof record.nameQualifier === "string" ? record.nameQualifier : null,
+    spNameQualifier: typeof record.spNameQualifier === "string" ? record.spNameQualifier : null,
+    state,
+    terminationResult,
+    responseResult,
+    stage,
+    attempts: typeof record.attempts === "number" ? record.attempts : 1,
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : "",
+    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : "",
+    failure: parseLogoutFailure(record.failure),
+  };
+}
+
+function parseLogoutSessionState(value: string | null): LogoutSessionState | null {
+  const record = parseJsonObject(value);
+  if (record?.kind !== "logout-session") {
+    return null;
+  }
+  const report = parseLogoutRecord(value);
+  return report == null ? null : logoutSessionStateFromReport(report);
+}
+
+function logoutSessionStateFromReport(report: LogoutReport): LogoutSessionState {
+  return {
+    version: report.version,
+    kind: "logout-session",
+    requestId: report.requestId,
+    requestIssueInstant: report.requestIssueInstant,
+    sessionGeneration: report.sessionGeneration,
+    sessionIndex: report.sessionIndex,
+    nameID: report.nameID,
+    nameIDFormat: report.nameIDFormat,
+    nameQualifier: report.nameQualifier,
+    spNameQualifier: report.spNameQualifier,
+    state: report.state,
+    terminationResult: report.terminationResult,
+    responseResult: report.responseResult,
+    stage: report.stage,
+    attempts: report.attempts,
+    createdAt: report.createdAt,
+    updatedAt: report.updatedAt,
+    failure: report.failure,
+  };
+}
+
+function logoutReportFromSessionState(state: LogoutSessionState): LogoutReport {
+  return {
+    version: state.version,
+    kind: "logout",
+    requestId: state.requestId,
+    requestIssueInstant: state.requestIssueInstant,
+    sessionGeneration: state.sessionGeneration,
+    sessionIndex: state.sessionIndex,
+    nameID: state.nameID,
+    nameIDFormat: state.nameIDFormat,
+    nameQualifier: state.nameQualifier,
+    spNameQualifier: state.spNameQualifier,
+    state: state.state,
+    terminationResult: state.terminationResult,
+    responseResult: state.responseResult,
+    stage: state.stage,
+    attempts: state.attempts,
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt,
+    failure: state.failure,
+  };
+}
+
+async function putCacheValueAsync(
+  cacheProvider: CacheProvider,
+  key: string,
+  value: string,
+): Promise<void> {
+  if (cacheProvider.updateAsync) {
+    if (await cacheProvider.updateAsync(key, value)) {
+      return;
+    }
+  } else {
+    await cacheProvider.removeAsync(key);
+  }
+  const saved = await cacheProvider.saveAsync(key, value);
+  if (saved == null && cacheProvider.updateAsync) {
+    // Another writer inserted the key between the update and the insert; publish ours in place.
+    await cacheProvider.updateAsync(key, value);
+  }
+}
+
+async function currentLogoutGenerationAsync(
+  cacheProvider: CacheProvider,
+  issuer: string,
+): Promise<number> {
+  return parseGeneration(await cacheProvider.getAsync(logoutGenerationKey(issuer)));
+}
+
+async function nextLogoutGenerationAsync(
+  cacheProvider: CacheProvider,
+  issuer: string,
+): Promise<number> {
+  const key = logoutGenerationKey(issuer);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const currentValue = await cacheProvider.getAsync(key);
+    const next = parseGeneration(currentValue) + 1;
+    if (cacheProvider.compareAndSwapAsync) {
+      if (await cacheProvider.compareAndSwapAsync(key, currentValue, String(next))) {
+        return next;
+      }
+      continue;
+    }
+    await putCacheValueAsync(cacheProvider, key, String(next));
+    return next;
+  }
+  throw new Error("Could not allocate a logout session generation");
+}
+
+function logoutFailureLocation(stage: LogoutStage): string {
+  switch (stage) {
+    case "response-status":
+      return "src/saml.ts:SAML.verifyLogoutResponse (status)";
+    case "response-issuer":
+      return "src/saml.ts:SAML.verifyIssuer";
+    case "response-in-response-to":
+      return "src/saml.ts:SAML.validateInResponseTo";
+    case "login-generation":
+      return "src/saml.ts:SAML.assertLoginSessionGenerationAsync";
+    case "response-signature":
+      return "src/saml.ts:SAML.validatePostResponseAsync/validateRedirectAsync (signature)";
+    case "request-url":
+      return "src/saml.ts:SAML.getLogoutUrlAsync";
+    case "initiated":
+      return "src/saml.ts:SAML._generateLogoutRequest";
+    default:
+      return "src/saml.ts:SAML.validatePostResponseAsync/validateRedirectAsync";
+  }
+}
+
+function logoutFailureFrom(err: unknown, fallbackStage: LogoutStage): LogoutFailure {
+  const message = err instanceof Error ? err.message : String(err);
+  let stage = fallbackStage;
+  if (message.startsWith("Bad status code")) {
+    stage = "response-status";
+  } else if (
+    message.startsWith("Unknown SAML issuer") ||
+    message.startsWith("Missing SAML issuer") ||
+    message.startsWith("Expected one SAML issuer")
+  ) {
+    stage = "response-issuer";
+  } else if (message.includes("InResponseTo")) {
+    stage = "response-in-response-to";
+  } else if (message.toLowerCase().includes("signature")) {
+    stage = "response-signature";
+  }
+  return { stage, message, location: logoutFailureLocation(stage) };
+}
+
+function logoutReportWithFailure(
+  report: LogoutReport,
+  err: unknown,
+  fallbackStage: LogoutStage,
+): LogoutReport {
+  const failure = logoutFailureFrom(err, fallbackStage);
+  return { ...report, stage: failure.stage, updatedAt: generateInstant(), failure };
+}
+
+function attachLogoutReport(err: unknown, report: LogoutReport | null): void {
+  if (report == null || !(err instanceof Error)) {
+    return;
+  }
+  Object.defineProperty(err, "logoutReport", {
+    configurable: true,
+    enumerable: false,
+    value: report,
+    writable: true,
+  });
+}
+
+function hasLogoutReport(err: unknown): boolean {
+  return err instanceof Error && Object.prototype.hasOwnProperty.call(err, "logoutReport");
+}
+
+function withLogoutReport<T extends { profile: Profile | null; loggedOut: boolean }>(
+  result: T,
+  report: LogoutReport | null,
+): T & { logoutReport?: LogoutReport } {
+  if (report != null) {
+    Object.defineProperty(result, "logoutReport", {
+      configurable: true,
+      enumerable: false,
+      value: report,
+      writable: true,
+    });
+  }
+  return result;
 }
 
 // An unsigned Response's InResponseTo can name any request, the sender's own or someone else's
@@ -651,6 +990,13 @@ class SAML {
 
     if (this.mustValidateInResponseTo(true)) {
       await this.cacheProvider.saveAsync(id, instant);
+      // A login issued after a logout shares the current generation; an assertion from a login
+      // issued before it must not re-establish the terminated session after a restart.
+      await putCacheValueAsync(
+        this.cacheProvider,
+        loginGenerationKey(this.options.issuer, id),
+        String(await currentLogoutGenerationAsync(this.cacheProvider, this.options.issuer)),
+      );
     }
     const request: AuthorizeRequestXML = {
       "samlp:AuthnRequest": {
@@ -791,21 +1137,63 @@ class SAML {
   async _generateLogoutRequest(this: SAML, user: Profile): Promise<string> {
     const id = this.options.generateUniqueId();
     const instant = generateInstant();
+    if (
+      this.options.samlLogoutRequestExtensions != null &&
+      typeof this.options.samlLogoutRequestExtensions !== "object"
+    ) {
+      throw new TypeError("samlLogoutRequestExtensions should be Object");
+    }
+    const sessionKey = logoutSessionKey(this.options.issuer, user);
+    const currentSession = await this.readLogoutSessionAsync(user);
+
+    let requestId = id;
+    let requestInstant = instant;
+    let sessionGeneration: number;
+    let attempts = 1;
+    let frozenUser = user;
+
+    if (currentSession != null && currentSession.terminationResult === "terminated") {
+      attempts = currentSession.attempts + 1;
+      // A pending or failed request is retried with the same ID and bytes, so the IdP can
+      // recognize it as one transaction. A completed request has already consumed its ID; a
+      // retry starts a new request and a new generation so a login issued before this logout
+      // cannot become current again.
+      if (currentSession.responseResult === "success") {
+        sessionGeneration = await nextLogoutGenerationAsync(
+          this.cacheProvider,
+          this.options.issuer,
+        );
+      } else {
+        sessionGeneration = currentSession.sessionGeneration;
+        requestId = currentSession.requestId;
+        requestInstant = currentSession.requestIssueInstant || instant;
+      }
+      frozenUser = {
+        ...user,
+        nameID: currentSession.nameID,
+        nameIDFormat: currentSession.nameIDFormat ?? user.nameIDFormat,
+        nameQualifier: currentSession.nameQualifier ?? user.nameQualifier,
+        spNameQualifier: currentSession.spNameQualifier ?? user.spNameQualifier,
+        sessionIndex: currentSession.sessionIndex ?? user.sessionIndex,
+      };
+    } else {
+      sessionGeneration = await nextLogoutGenerationAsync(this.cacheProvider, this.options.issuer);
+    }
 
     const request = {
       "samlp:LogoutRequest": {
         "@xmlns:samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
         "@xmlns:saml": "urn:oasis:names:tc:SAML:2.0:assertion",
-        "@ID": id,
+        "@ID": requestId,
         "@Version": "2.0",
-        "@IssueInstant": instant,
+        "@IssueInstant": requestInstant,
         "@Destination": this.options.logoutUrl,
         "saml:Issuer": {
           "@xmlns:saml": "urn:oasis:names:tc:SAML:2.0:assertion",
           "#text": this.options.issuer,
         },
         "samlp:Extensions": {},
-        "saml:NameID": { "@Format": user.nameIDFormat, "#text": user.nameID },
+        "saml:NameID": { "@Format": frozenUser.nameIDFormat, "#text": frozenUser.nameID },
       },
     } as LogoutRequestXML;
 
@@ -822,23 +1210,234 @@ class SAML {
       delete request["samlp:LogoutRequest"]["samlp:Extensions"];
     }
 
-    if (user.nameQualifier != null) {
-      request["samlp:LogoutRequest"]["saml:NameID"]["@NameQualifier"] = user.nameQualifier;
+    if (frozenUser.nameQualifier != null) {
+      request["samlp:LogoutRequest"]["saml:NameID"]["@NameQualifier"] = frozenUser.nameQualifier;
     }
 
-    if (user.spNameQualifier != null) {
-      request["samlp:LogoutRequest"]["saml:NameID"]["@SPNameQualifier"] = user.spNameQualifier;
+    if (frozenUser.spNameQualifier != null) {
+      request["samlp:LogoutRequest"]["saml:NameID"]["@SPNameQualifier"] =
+        frozenUser.spNameQualifier;
     }
 
-    if (user.sessionIndex) {
+    if (frozenUser.sessionIndex) {
       request["samlp:LogoutRequest"]["saml2p:SessionIndex"] = {
         "@xmlns:saml2p": "urn:oasis:names:tc:SAML:2.0:protocol",
-        "#text": user.sessionIndex,
+        "#text": frozenUser.sessionIndex,
       };
     }
 
-    await this.cacheProvider.saveAsync(id, instant);
-    return buildXmlBuilderObject(request, false);
+    const now = generateInstant();
+    const report: LogoutReport = {
+      version: 1,
+      kind: "logout",
+      requestId,
+      requestIssueInstant: requestInstant,
+      sessionGeneration,
+      sessionIndex: frozenUser.sessionIndex ?? null,
+      nameID: frozenUser.nameID,
+      nameIDFormat: frozenUser.nameIDFormat ?? null,
+      nameQualifier: frozenUser.nameQualifier ?? null,
+      spNameQualifier: frozenUser.spNameQualifier ?? null,
+      state: "pending",
+      terminationResult: "terminated",
+      responseResult: "none",
+      stage: "initiated",
+      attempts,
+      createdAt: currentSession?.createdAt || now,
+      updatedAt: now,
+    };
+    const state = logoutSessionStateFromReport(report);
+    const requestXml = buildXmlBuilderObject(request, false);
+
+    // The session record is written first: it names the request that a retry must reuse even if
+    // this process stops before the request itself is recorded or delivered.
+    await putCacheValueAsync(this.cacheProvider, sessionKey, JSON.stringify(state));
+    await putCacheValueAsync(
+      this.cacheProvider,
+      logoutReportKey(this.options.issuer, requestId),
+      JSON.stringify(report),
+    );
+    // The request ID itself stays the value existing consumers and `validateInResponseTo` read.
+    await putCacheValueAsync(this.cacheProvider, requestId, requestInstant);
+    return requestXml;
+  }
+
+  private async readLogoutSessionAsync(user: Profile): Promise<LogoutSessionState | null> {
+    const value = await this.cacheProvider.getAsync(logoutSessionKey(this.options.issuer, user));
+    if (value == null) {
+      return null;
+    }
+    const session = parseLogoutSessionState(value);
+    if (session == null) {
+      throw new Error("Logout session state is invalid");
+    }
+    return session;
+  }
+
+  private async readStoredLogoutReportAsync(requestId: string): Promise<LogoutReport | null> {
+    const value = await this.cacheProvider.getAsync(
+      logoutReportKey(this.options.issuer, requestId),
+    );
+    if (value == null) {
+      return null;
+    }
+    const report = parseLogoutRecord(value);
+    if (report == null) {
+      throw new Error("Logout report is invalid");
+    }
+    return report;
+  }
+
+  private async readLogoutReportAsync(requestId: string): Promise<LogoutReport | null> {
+    const stored = await this.readStoredLogoutReportAsync(requestId);
+    if (stored != null) {
+      return stored;
+    }
+    const legacy = await this.cacheProvider.getAsync(requestId);
+    if (legacy == null) {
+      return null;
+    }
+    const parsed = parseLogoutRecord(legacy);
+    if (parsed != null) {
+      return parsed;
+    }
+    // A pre-existing entry is a bare IssueInstant. It carries no generation, but it is still a
+    // complete pending request that existing consumers can validate.
+    const createdAt = Number.isNaN(Date.parse(legacy)) ? generateInstant() : legacy;
+    return {
+      version: 1,
+      kind: "logout",
+      requestId,
+      requestIssueInstant: createdAt,
+      sessionGeneration: 0,
+      sessionIndex: null,
+      nameID: "",
+      nameIDFormat: null,
+      nameQualifier: null,
+      spNameQualifier: null,
+      state: "pending",
+      terminationResult: "not-terminated",
+      responseResult: "none",
+      stage: "legacy",
+      attempts: 1,
+      createdAt,
+      updatedAt: createdAt,
+    };
+  }
+
+  private async writeLogoutReportAsync(report: LogoutReport): Promise<void> {
+    const state = logoutSessionStateFromReport(report);
+    await putCacheValueAsync(
+      this.cacheProvider,
+      logoutSessionKey(this.options.issuer, report),
+      JSON.stringify(state),
+    );
+    await putCacheValueAsync(
+      this.cacheProvider,
+      logoutReportKey(this.options.issuer, report.requestId),
+      JSON.stringify(report),
+    );
+  }
+
+  private async recordLogoutResponseAsync(
+    requestId: string | null,
+    responseResult: LogoutResponseResult,
+    err?: unknown,
+    fallbackStage: LogoutStage = "response-validation",
+  ): Promise<LogoutReport | null> {
+    if (requestId == null) {
+      return null;
+    }
+    const current = await this.readStoredLogoutReportAsync(requestId);
+    if (current == null) {
+      return null;
+    }
+    // A duplicate response must not downgrade the one successful commit it duplicates.
+    if (current.responseResult === "success") {
+      const rejected =
+        responseResult === "failure" || responseResult === "replay"
+          ? logoutReportWithFailure(current, err, fallbackStage)
+          : current;
+      attachLogoutReport(err, rejected);
+      return rejected;
+    }
+    const now = generateInstant();
+    const failure =
+      responseResult === "failure" || responseResult === "replay"
+        ? logoutFailureFrom(err, fallbackStage)
+        : undefined;
+    const report: LogoutReport = {
+      ...current,
+      state: responseResult === "success" ? "terminated" : "failed",
+      terminationResult: "terminated",
+      responseResult,
+      stage: responseResult === "success" ? "committed" : failure?.stage ?? fallbackStage,
+      updatedAt: now,
+      failure,
+    };
+    await this.writeLogoutReportAsync(report);
+    attachLogoutReport(err, report);
+    return report;
+  }
+
+  private async assertLoginSessionGenerationAsync(
+    profile: Profile,
+    answeredRequestId: string | null,
+  ): Promise<void> {
+    if (profile.sessionIndex == null) {
+      // Without a SessionIndex there is no durable identity to tie an old assertion to a
+      // logged-out session, and rejecting would also reject a legitimate anonymous login.
+      return;
+    }
+    const session = await this.readLogoutSessionAsync(profile);
+    if (session == null || session.terminationResult !== "terminated") {
+      return;
+    }
+    const loginGeneration =
+      answeredRequestId == null
+        ? null
+        : parseLoginGeneration(
+            await this.cacheProvider.getAsync(
+              loginGenerationKey(this.options.issuer, answeredRequestId),
+            ),
+          );
+    // A request issued after the logout shares its generation. An older request, or one whose
+    // generation cannot be recovered, cannot establish a new session for that SessionIndex.
+    if (loginGeneration != null) {
+      if (loginGeneration >= session.sessionGeneration) {
+        return;
+      }
+    } else {
+      // With InResponseTo validation off there is no request generation to compare. A new login
+      // is still distinguishable by its signed IssueInstant: it postdates the logout request.
+      let assertionIssueInstant: string | null = null;
+      try {
+        const assertionXml = profile.getAssertionXml?.();
+        if (assertionXml != null) {
+          const assertionDoc = (await parseXml2JsFromString(assertionXml)) as XMLOutput;
+          const value = assertionDoc.Assertion?.$?.IssueInstant;
+          assertionIssueInstant = typeof value === "string" ? value : null;
+        }
+      } catch {
+        assertionIssueInstant = null;
+      }
+      const issuedAtMs = assertionIssueInstant == null ? NaN : Date.parse(assertionIssueInstant);
+      const logoutStartedAtMs = Date.parse(session.createdAt);
+      if (!Number.isNaN(issuedAtMs) && issuedAtMs > logoutStartedAtMs) {
+        return;
+      }
+    }
+    const message = `The SAML session ${profile.sessionIndex} was terminated by logout request ${session.requestId} (generation ${session.sessionGeneration}); the assertion has login generation ${loginGeneration ?? "unknown"}`;
+    const report: LogoutReport = {
+      ...logoutReportFromSessionState(session),
+      stage: "login-generation",
+      failure: {
+        stage: "login-generation",
+        message,
+        location: logoutFailureLocation("login-generation"),
+      },
+    };
+    throw new LogoutSessionTerminatedError(message, report);
   }
 
   _generateLogoutResponse(this: SAML, logoutRequest: Profile, success: boolean): string {
@@ -1099,12 +1698,118 @@ class SAML {
     const request = await this._generateLogoutRequest(user);
     const operation = "logout";
     const overrideParams = options ? options.additionalParams || {} : {};
-    return await this._requestToUrlAsync(
-      request,
-      null,
-      operation,
-      this._getAdditionalParams(RelayState, operation, overrideParams),
-    );
+    try {
+      return await this._requestToUrlAsync(
+        request,
+        null,
+        operation,
+        this._getAdditionalParams(RelayState, operation, overrideParams),
+      );
+    } catch (err) {
+      try {
+        const requestDoc = (await parseXml2JsFromString(request)) as XMLOutput;
+        const requestId = requestDoc.LogoutRequest?.$?.ID as string | undefined;
+        if (requestId != null) {
+          await this.recordLogoutResponseAsync(requestId, "failure", err, "request-url");
+        }
+      } catch {
+        // The URL-building error is the one the caller needs; the report is best effort here.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Starts an SP-initiated logout and returns both the URL and the durable report for it.
+   *
+   * The local session is terminated when the request is created, before the identity provider
+   * answers. If the answer is lost, a retry reuses the same request ID and session generation
+   * after a failure, or starts a new request in a new generation after a success. Neither
+   * restores the terminated session.
+   *
+   * @throws {LogoutError} If a report cannot be produced for the request.
+   */
+  async beginLogoutAsync(
+    user: Profile,
+    RelayState: string,
+    options: AuthOptions,
+  ): Promise<LogoutResult> {
+    const request = await this._generateLogoutRequest(user);
+    const requestDoc = (await parseXml2JsFromString(request)) as XMLOutput;
+    const requestId = requestDoc.LogoutRequest?.$?.ID as string | undefined;
+    if (requestId == null) {
+      throw new Error("Logout request has no ID");
+    }
+    const report = await this.readLogoutReportAsync(requestId);
+    if (report == null) {
+      throw new LogoutError("Logout request was created without a transaction report", {
+        version: 1,
+        kind: "logout",
+        requestId,
+        requestIssueInstant: generateInstant(),
+        sessionGeneration: 0,
+        sessionIndex: user.sessionIndex ?? null,
+        nameID: user.nameID,
+        nameIDFormat: user.nameIDFormat ?? null,
+        nameQualifier: user.nameQualifier ?? null,
+        spNameQualifier: user.spNameQualifier ?? null,
+        state: "pending",
+        terminationResult: "terminated",
+        responseResult: "none",
+        stage: "initiated",
+        attempts: 1,
+        createdAt: generateInstant(),
+        updatedAt: generateInstant(),
+      });
+    }
+
+    const operation = "logout";
+    const overrideParams = options ? options.additionalParams || {} : {};
+    try {
+      const url = await this._requestToUrlAsync(
+        request,
+        null,
+        operation,
+        this._getAdditionalParams(RelayState, operation, overrideParams),
+      );
+      return { url, report };
+    } catch (err) {
+      const failed = await this.recordLogoutResponseAsync(requestId, "failure", err, "request-url");
+      attachLogoutReport(err, failed ?? report);
+      throw err;
+    }
+  }
+
+  /**
+   * Reads the durable report for a logout request ID or for a profile's session.
+   *
+   * A request ID remains readable after its response was consumed, and a profile remains readable
+   * after a restart when the same cache provider (or a shared one) is used. A pre-existing cache
+   * entry that holds only an IssueInstant is reported as a legacy transaction.
+   */
+  async getLogoutReportAsync(requestIdOrUser: string | Profile): Promise<LogoutReport | null> {
+    if (typeof requestIdOrUser === "string") {
+      return this.readLogoutReportAsync(requestIdOrUser);
+    }
+    return this.recoverLogoutSessionAsync(requestIdOrUser);
+  }
+
+  /**
+   * Reads the complete state a consumer should see after a restart: either no logout transaction
+   * for the profile's session, or the transaction with its local termination result already
+   * committed. It never returns a partially applied logout.
+   */
+  async recoverLogoutSessionAsync(user: Profile): Promise<LogoutReport | null> {
+    const session = await this.readLogoutSessionAsync(user);
+    if (session == null) {
+      return null;
+    }
+    const report = await this.readLogoutReportAsync(session.requestId);
+    if (report == null) {
+      return logoutReportFromSessionState(session);
+    }
+    // The request record is written after the session record, so it carries the later stage.
+    return report.updatedAt >= session.updatedAt ? report : logoutReportFromSessionState(session);
   }
 
   getLogoutResponseUrl(
@@ -1203,13 +1908,18 @@ class SAML {
 
   async validatePostResponseAsync(
     container: Record<string, string>,
-  ): Promise<{ profile: Profile | null; loggedOut: boolean }> {
+  ): Promise<{ profile: Profile | null; loggedOut: boolean; logoutReport?: LogoutReport }> {
     let xml: string;
     let doc: Document;
     let inResponseTo: string | null = null;
     let verifiedInResponseTo: string | null = null;
     let verifiedDestination: string | null = null;
     let verifiedAssertionXml: string | null = null;
+    let logoutRequestId: string | null = null;
+    let logoutReport: LogoutReport | null = null;
+    // Read before a signature is known, but used only to annotate a rejection; never written.
+    let logoutEvidence: LogoutReport | null = null;
+    let logoutResponseAccepted = false;
 
     try {
       xml = Buffer.from(container.SAMLResponse, "base64").toString("utf8");
@@ -1222,6 +1932,13 @@ class SAML {
 
       if (inResponseToNodes) {
         inResponseTo = inResponseToNodes.length ? inResponseToNodes[0].nodeValue : null;
+        if (inResponseTo != null) {
+          try {
+            logoutEvidence = await this.readStoredLogoutReportAsync(inResponseTo);
+          } catch {
+            logoutEvidence = null;
+          }
+        }
 
         await this.validateInResponseTo(inResponseTo);
       }
@@ -1330,15 +2047,19 @@ class SAML {
           responseVerifiedXml ? verifiedInResponseTo : inResponseTo,
           responseVerifiedXml != null,
         );
+        let answeredRequestId: string | null = null;
+        if (this.mustValidateInResponseTo(Boolean(inResponseTo))) {
+          answeredRequestId = responseVerifiedXml
+            ? verifiedInResponseTo
+            : ((await getSubjectInResponseTosAsync(signedAssertion)).find(
+                (subjectInResponseTo) => subjectInResponseTo === inResponseTo,
+              ) ?? null);
+        }
+        await this.assertLoginSessionGenerationAsync(result.profile, answeredRequestId);
         // Consumed here, not in the overridable method, whose inResponseToIsVerified an override
         // written before that parameter drops. Unless the Response is signed, only the assertion
         // can name the request it answers.
         if (this.mustValidateInResponseTo(Boolean(inResponseTo))) {
-          const answeredRequestId = responseVerifiedXml
-            ? verifiedInResponseTo
-            : (await getSubjectInResponseTosAsync(signedAssertion)).find(
-                (subjectInResponseTo) => subjectInResponseTo === inResponseTo,
-              );
           await consumeInResponseToAsync(this.cacheProvider, answeredRequestId ?? null);
         }
         // An unsigned Response's Destination is not verified, so it is not read.
@@ -1416,9 +2137,14 @@ class SAML {
         }
         const logoutResponse = xmljsDoc.LogoutResponse;
         if (logoutResponse) {
+          logoutRequestId = verifiedInResponseTo;
           await this.verifyLogoutResponse(xmljsDoc);
           if (this.mustValidateInResponseTo(Boolean(verifiedInResponseTo))) {
             await consumeInResponseToAsync(this.cacheProvider, verifiedInResponseTo);
+          }
+          if (logoutRequestId != null) {
+            logoutResponseAccepted = true;
+            logoutReport = await this.recordLogoutResponseAsync(logoutRequestId, "success");
           }
           warnIfDestinationIsNot(
             "logoutCallbackUrl",
@@ -1426,13 +2152,21 @@ class SAML {
             "LogoutResponse",
             verifiedDestination,
           );
-          return { profile: null, loggedOut: true };
+          return withLogoutReport({ profile: null, loggedOut: true }, logoutReport);
         } else {
           throw new Error("Unknown SAML response message");
         }
       }
     } catch (err) {
       debugLog.enabled && debugLog("validatePostResponse resulted in an error: %s", err);
+      if (logoutRequestId != null && !logoutResponseAccepted) {
+        await this.recordLogoutResponseAsync(logoutRequestId, "failure", err);
+      } else if (logoutRequestId == null && logoutEvidence != null && !hasLogoutReport(err)) {
+        attachLogoutReport(
+          err,
+          logoutReportWithFailure(logoutEvidence, err, "response-validation"),
+        );
+      }
       // A failure the IdP signed means it answered the request, so no other response is coming.
       // An unsigned one proves nothing about the request it names, so that request stays pending.
       // Gated as success is, so under "ifPresent" a failure retires nothing a success would keep.
@@ -1485,7 +2219,7 @@ class SAML {
   validateRedirectAsync(
     container: ParsedQs,
     originalQuery: string,
-  ): Promise<{ profile: Profile | null; loggedOut: boolean }>;
+  ): Promise<{ profile: Profile | null; loggedOut: boolean; logoutReport?: LogoutReport }>;
   /**
    * Validates a `LogoutRequest` or `LogoutResponse` received over the HTTP-Redirect binding.
    *
@@ -1500,7 +2234,12 @@ class SAML {
    */
   validateRedirectAsync(
     ...args: [originalQuery: string] | [container: ParsedQs, originalQuery: string]
-  ): Promise<{ profile: Profile | null; loggedOut: boolean; relayState?: string | undefined }>;
+  ): Promise<{
+    profile: Profile | null;
+    loggedOut: boolean;
+    relayState?: string | undefined;
+    logoutReport?: LogoutReport;
+  }>;
   /**
    * @deprecated Call `validateRedirectAsync(originalQuery)` and use the `relayState` it returns: a
    *   parse of the query string can hold a parameter that the signature does not cover.
@@ -1509,10 +2248,15 @@ class SAML {
   validateRedirectAsync(
     container: ParsedQs,
     originalQuery: string,
-  ): Promise<{ profile: Profile | null; loggedOut: boolean }>;
+  ): Promise<{ profile: Profile | null; loggedOut: boolean; logoutReport?: LogoutReport }>;
   async validateRedirectAsync(
     ...args: [originalQuery: string] | [container: ParsedQs, originalQuery: string]
-  ): Promise<{ profile: Profile | null; loggedOut: boolean; relayState?: string | undefined }> {
+  ): Promise<{
+    profile: Profile | null;
+    loggedOut: boolean;
+    relayState?: string | undefined;
+    logoutReport?: LogoutReport;
+  }> {
     const [originalQueryOrContainer, legacyOriginalQuery] = args;
     const { container, originalQuery, parameters, legacy } = resolveRedirectArguments(
       originalQueryOrContainer,
@@ -1522,11 +2266,30 @@ class SAML {
 
     const data = Buffer.from(samlMessage, "base64");
     const inflated = await inflateRawAsync(data);
+    let logoutReport: LogoutReport | null = null;
 
     const dom = await parseDomFromString(inflated.toString());
     const doc: XMLOutput = await parseXml2JsFromString(inflated);
+    let logoutEvidence: LogoutReport | null = null;
+    if (samlMessageType === "SAMLResponse") {
+      const candidate = doc.LogoutResponse?.$?.InResponseTo;
+      if (typeof candidate === "string") {
+        try {
+          logoutEvidence = await this.readStoredLogoutReportAsync(candidate);
+        } catch {
+          logoutEvidence = null;
+        }
+      }
+    }
     // Before the checks below, so a signed response that fails them still retires its request.
-    await this.hasValidSignatureForRedirect(container, originalQuery);
+    try {
+      await this.hasValidSignatureForRedirect(container, originalQuery);
+    } catch (err) {
+      if (logoutEvidence != null) {
+        attachLogoutReport(err, logoutReportWithFailure(logoutEvidence, err, "response-signature"));
+      }
+      throw err;
+    }
     if (samlMessageType === "SAMLRequest") {
       this.verifyLogoutRequest(doc);
     } else {
@@ -1537,13 +2300,22 @@ class SAML {
       try {
         await this.verifyLogoutResponse(doc);
       } catch (err) {
+        await this.recordLogoutResponseAsync(signedInResponseTo, "failure", err);
         if (retire) {
           await this.cacheProvider.removeAsync(signedInResponseTo);
         }
         throw err;
       }
       if (retire) {
-        await consumeInResponseToAsync(this.cacheProvider, signedInResponseTo);
+        try {
+          await consumeInResponseToAsync(this.cacheProvider, signedInResponseTo);
+        } catch (err) {
+          await this.recordLogoutResponseAsync(signedInResponseTo, "replay", err);
+          throw err;
+        }
+      }
+      if (signedInResponseTo != null) {
+        logoutReport = await this.recordLogoutResponseAsync(signedInResponseTo, "success");
       }
     }
     const result = await this.processValidlySignedSamlLogoutAsync(doc, dom);
@@ -1556,7 +2328,9 @@ class SAML {
         getRootAttribute(dom, "Destination"),
       );
     }
-    return legacy ? result : { ...result, relayState: parameters.relayState };
+    return legacy
+      ? withLogoutReport(result, logoutReport)
+      : withLogoutReport({ ...result, relayState: parameters.relayState }, logoutReport);
   }
 
   /**
