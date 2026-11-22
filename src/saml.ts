@@ -258,11 +258,20 @@ function assertionAcceptedUntilMs(
 
 class ReplayedAssertionError extends Error {}
 
+// A NotBefore/NotOnOrAfter rejection. The assertion's ID stays in the cache: one rejected as not
+// yet valid becomes replayable the moment its window opens, and an expired one's ID is kept only
+// until its own NotOnOrAfter anyway. Every other rejection rolls the record back, since keeping
+// it would let an attacker pre-reject the genuine response by presenting a malformed copy first.
+class AssertionTimeWindowError extends Error {}
+
 // SAML profiles §4.1.4.5: the SP remembers the ID of each assertion it accepts for as long as that
 // assertion would be valid. It is recorded before the checks that can still reject the assertion, so
 // one rejected as not yet valid cannot be presented again once it is.
 // https://docs.oasis-open.org/security/saml/v2.0/saml-profiles-2.0-os.pdf
-async function recordAssertionAsync(assertionXml: string, options: SamlOptions): Promise<void> {
+async function recordAssertionAsync(
+  assertionXml: string,
+  options: SamlOptions,
+): Promise<string | null> {
   const doc: XMLOutput = await parseXml2JsFromString(assertionXml);
   const assertion: XMLOutput = doc.Assertion;
   const id = assertion.$?.ID;
@@ -280,7 +289,7 @@ async function recordAssertionAsync(assertionXml: string, options: SamlOptions):
     );
   }
   if (acceptedUntilMs <= new Date().getTime()) {
-    return; // already expired, which the checks that follow reject
+    return null; // already expired, which the checks that follow reject
   }
 
   // Kept apart from request IDs, which are stored as they are, and from other identity providers'.
@@ -290,6 +299,7 @@ async function recordAssertionAsync(assertionXml: string, options: SamlOptions):
   if (!(await cacheProvider.saveIfAbsentAsync(key, generateInstant(), acceptedUntilMs))) {
     throw new ReplayedAssertionError(`The assertion ${id} has already been received`);
   }
+  return key;
 }
 
 const inflateRawAsync = util.promisify(zlib.inflateRaw);
@@ -1210,6 +1220,9 @@ class SAML {
     let verifiedInResponseTo: string | null = null;
     let verifiedDestination: string | null = null;
     let verifiedAssertionXml: string | null = null;
+    // The cache key `recordAssertionAsync` reserved, so a failure that must not leave a record
+    // can release exactly this one. Null when nothing was recorded (option off, expired, replay).
+    let recordedAssertionKey: string | null = null;
 
     try {
       xml = Buffer.from(container.SAMLResponse, "base64").toString("utf8");
@@ -1322,7 +1335,7 @@ class SAML {
         }
         verifiedAssertionXml = signedAssertion;
         if (this.options.rejectReplayedAssertions) {
-          await recordAssertionAsync(signedAssertion, this.options);
+          recordedAssertionKey = await recordAssertionAsync(signedAssertion, this.options);
         }
         const result = await this.processValidlySignedAssertionAsync(
           signedAssertion,
@@ -1433,6 +1446,17 @@ class SAML {
       }
     } catch (err) {
       debugLog.enabled && debugLog("validatePostResponse resulted in an error: %s", err);
+      // A time-window rejection keeps the record: an assertion rejected as not yet valid can be
+      // replayed once its window opens, and an expired one's key expires on its own. Any other
+      // rejection releases the key, so presenting a malformed copy cannot pre-reject the genuine
+      // response, and a response is either consumed whole or leaves no assertion ID behind.
+      if (
+        recordedAssertionKey != null &&
+        !(err instanceof ReplayedAssertionError) &&
+        !(err instanceof AssertionTimeWindowError)
+      ) {
+        await this.cacheProvider.removeAsync(recordedAssertionKey);
+      }
       // A failure the IdP signed means it answered the request, so no other response is coming.
       // An unsigned one proves nothing about the request it names, so that request stays pending.
       // Gated as success is, so under "ifPresent" a failure retires nothing a success would keep.
@@ -2015,16 +2039,16 @@ class SAML {
     if (notBefore) {
       const notBeforeMs = dateStringToTimestamp(notBefore, "NotBefore");
       if (nowMs + this.options.acceptedClockSkewMs < notBeforeMs)
-        return new Error("SAML assertion not yet valid");
+        return new AssertionTimeWindowError("SAML assertion not yet valid");
     }
     if (notOnOrAfter) {
       const notOnOrAfterMs = dateStringToTimestamp(notOnOrAfter, "NotOnOrAfter");
       if (nowMs - this.options.acceptedClockSkewMs >= notOnOrAfterMs)
-        return new Error("SAML assertion expired: clocks skewed too much");
+        return new AssertionTimeWindowError("SAML assertion expired: clocks skewed too much");
     }
     if (maxTimeLimitMs != null) {
       if (nowMs - this.options.acceptedClockSkewMs >= maxTimeLimitMs)
-        return new Error("SAML assertion expired: assertion too old");
+        return new AssertionTimeWindowError("SAML assertion expired: assertion too old");
     }
 
     return null;

@@ -217,6 +217,26 @@ describe("rejectReplayedAssertions", function () {
     );
   });
 
+  it(
+    "keeps the recorded ID after a replay is rejected, so an attacker cannot pre-reject a login",
+    async () => {
+      const cacheProvider = new InMemoryCacheProvider();
+      const saml = newSaml({ cacheProvider });
+      const copy = response();
+      const assertionKey = JSON.stringify(["assertion", "idp", "_assertion"]);
+
+      expect(await outcome(saml.validatePostResponseAsync(copy))).to.equal("accepted");
+      expect(await cacheProvider.getAsync(assertionKey)).to.exist;
+
+      // The replay is rejected, and the record of the accepted assertion has to outlive it: the
+      // remembered ID is what stops the replayed bytes establishing a second session.
+      expect(await outcome(saml.validatePostResponseAsync(copy))).to.equal(
+        "The assertion _assertion has already been received",
+      );
+      expect(await cacheProvider.getAsync(assertionKey)).to.exist;
+    },
+  );
+
   it("keeps an ID until the latest moment the assertion could be accepted", async () => {
     const cacheProvider = new RecordingCacheProvider();
     const saml = newSaml({ cacheProvider, acceptedClockSkewMs: 1000 });
@@ -293,6 +313,64 @@ describe("rejectReplayedAssertions", function () {
     );
     expect(cacheProvider.expiries).to.deep.equal([]);
   });
+
+  it(
+    "leaves no ID behind when a content check after recording rejects the assertion",
+    async () => {
+      const cacheProvider = new InMemoryCacheProvider();
+      const saml = newSaml({ cacheProvider });
+      const assertionKey = JSON.stringify(["assertion", "idp", "_assertion"]);
+      // The signature verifies and the assertion is recorded before its audience is checked, but
+      // the audience does not match, so the response is rejected and must not be consumed at all.
+      const wrongAudience = response({
+        conditions:
+          `<saml:Conditions NotBefore="${instant(-60000)}" NotOnOrAfter="${instant(300000)}">` +
+          "<saml:AudienceRestriction><saml:Audience>someone-else</saml:Audience></saml:AudienceRestriction>" +
+          "</saml:Conditions>",
+      });
+
+      expect(await outcome(saml.validatePostResponseAsync(wrongAudience))).to.equal(
+        "SAML assertion audience mismatch. Expected: onesaml_login Received: someone-else",
+      );
+      expect(await cacheProvider.getAsync(assertionKey)).to.not.exist;
+
+      // With the record rolled back, the same bytes fail for the same reason again, never as a
+      // replay: a rejected validation cannot pre-reject a later, corrected response.
+      expect(await outcome(saml.validatePostResponseAsync(wrongAudience))).to.equal(
+        "SAML assertion audience mismatch. Expected: onesaml_login Received: someone-else",
+      );
+    },
+  );
+
+  it(
+    "rolls back only the assertion it recorded, leaving another assertion's record intact",
+    async () => {
+      const cacheProvider = new InMemoryCacheProvider();
+      const saml = newSaml({ cacheProvider });
+      const accepted = response({
+        assertionAttributes: ` ID="_accepted" Version="2.0" IssueInstant="${instant()}"`,
+      });
+      const rejected = response({
+        assertionAttributes: ` ID="_rejected" Version="2.0" IssueInstant="${instant()}"`,
+        conditions:
+          `<saml:Conditions NotBefore="${instant(-60000)}" NotOnOrAfter="${instant(300000)}">` +
+          "<saml:AudienceRestriction><saml:Audience>someone-else</saml:Audience></saml:AudienceRestriction>" +
+          "</saml:Conditions>",
+      });
+
+      expect(await outcome(saml.validatePostResponseAsync(accepted))).to.equal("accepted");
+      expect(await outcome(saml.validatePostResponseAsync(rejected))).to.match(
+        /SAML assertion audience mismatch/,
+      );
+
+      expect(
+        await cacheProvider.getAsync(JSON.stringify(["assertion", "idp", "_accepted"])),
+      ).to.exist;
+      expect(
+        await cacheProvider.getAsync(JSON.stringify(["assertion", "idp", "_rejected"])),
+      ).to.not.exist;
+    },
+  );
 
   it("rejects an assertion with no ID", async () => {
     const saml = newSaml({ wantAssertionsSigned: false });

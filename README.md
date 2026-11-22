@@ -1071,6 +1071,12 @@ your application started.
   providers sharing a cache do not collide. It is remembered as soon as the assertion's signature
   verifies, before the other checks, so an assertion rejected as not yet valid cannot be presented
   again once it is.
+- **When it is forgotten again:** a rejection on anything other than the assertion's time window
+  (its `NotBefore` and `NotOnOrAfter`) removes the record again. A response that does not validate
+  is therefore consumed as a whole or not at all, and presenting a malformed copy cannot pre-reject
+  the identity provider's genuine response. A rejection inside the time window keeps the record,
+  since an assertion rejected as not yet valid would otherwise become replayable once its window
+  opens; that record still expires no later than the assertion's own `NotOnOrAfter`.
 - **For how long:** until the last moment the assertion could still be accepted. That is the
   earlier of its `Conditions` `NotOnOrAfter` and the latest `NotOnOrAfter` among its
   `SubjectConfirmationData`, capped by `maxAssertionAgeMs`, plus `acceptedClockSkewMs`. An
