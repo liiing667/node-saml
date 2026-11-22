@@ -452,7 +452,7 @@ check is accepted. Run with `NODE_DEBUG=node-saml` to be told when one arrives, 
 | `audience`               | `issuer`                       | Expected `Audience` in the response. Set to `false` to skip the check — which removes a security control; see the note under [Security and signatures](#security-and-signatures).                 |
 | `privateKey`             | —                              | SP private key in PEM format, used to sign outgoing messages. See [Security and signatures](#security-and-signatures).                                                                            |
 | `publicCert`             | —                              | SP public signing certificate, embedded in the `AuthnRequest` so the IdP can verify it. Must match `privateKey`.                                                                                  |
-| `decryptionPvk`          | —                              | Private key used to decrypt encrypted assertions and encrypted name identifiers. See [Configuration option `decryptionPvk`](#configuration-option-decryptionpvk).                                 |
+| `decryptionPvk`          | —                              | Private key, or rotation window of keys, used to decrypt encrypted assertions and encrypted name identifiers. See [Configuration option `decryptionPvk`](#configuration-option-decryptionpvk).  |
 | `signatureAlgorithm`     | `"sha1"`                       | `"sha1"`, `"sha256"`, `"sha256-mgf1"`, or `"sha512"`. **Set this explicitly** if you set `privateKey`; see [Configuration option `signatureAlgorithm`](#configuration-option-signaturealgorithm). |
 | `digestAlgorithm`        | `"sha1"`                       | Digest algorithm for the signed data object: `"sha1"`, `"sha256"`, or `"sha512"`. Same advice as above. Required with `"sha256-mgf1"`.                                                            |
 | `xmlSignatureTransforms` | enveloped-signature + exc-c14n | Signature transforms used in HTTP-POST signatures. The default is `["http://www.w3.org/2000/09/xmldsig#enveloped-signature", "http://www.w3.org/2001/10/xml-exc-c14n#"]`.                         |
@@ -884,6 +884,25 @@ To decrypt encrypted assertions and encrypted name identifiers, provide the SP's
 ```javascript
 decryptionPvk: "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCXJP47MTKaFpkU ... ==";
 ```
+
+During a key rotation, pass the keys that may still receive ciphertext as an array:
+
+```javascript
+decryptionPvk: [currentPrivateKey, previousPrivateKey];
+```
+
+Each validation freezes the key list before decrypting. Every key is tried only against the
+`EncryptedKey` elements that accompany the ciphertext, so a failed attempt cannot leave the next
+key using the previous `EncryptedKey`'s key-transport or OAEP-digest algorithm. The first key that
+decrypts is the key reported on the profile; the same decrypted assertion is then verified,
+recorded for replay and given to the profile consumer.
+
+An encrypted response's profile includes an `encryptedResponse` report with the ciphertext digest,
+the selected key's fingerprint and generation, the selected `EncryptedKey` and algorithms, the
+assertion and NameID digests, and the replay-cache state. A rejection carries the same evidence on
+the thrown error, including the stage that rejected it. If the replay cache cannot record the
+assertion, the response is rejected; the library keeps a recovery marker so a retry cannot turn the
+same assertion into a new login.
 
 Accepted formats:
 

@@ -93,6 +93,121 @@ export type IdpCertCallback = (
 ) => void;
 
 /**
+ * A private key used to decrypt encrypted assertions and encrypted name identifiers.
+ */
+export type DecryptionPvk = string | Buffer;
+
+/**
+ * A decryption key, or a rotation window of several keys. Each key is tried in order against the
+ * `EncryptedKey` elements that accompany the ciphertext.
+ */
+export type DecryptionPvkOption = DecryptionPvk | DecryptionPvk[];
+
+/**
+ * The point at which an encrypted response was accepted or rejected.
+ */
+export type EncryptedResponseStage =
+  | "admission"
+  | "decrypt"
+  | "decrypted"
+  | "verify-signature"
+  | "replay-cache"
+  | "profile"
+  | "complete";
+
+/**
+ * The state of the assertion's replay record.
+ */
+export type EncryptedResponseCacheState =
+  | "not-configured"
+  | "pending"
+  | "committed"
+  | "replayed"
+  | "failed";
+
+/**
+ * The identities and stage that authenticated an encrypted response: the ciphertext, the key that
+ * decrypted it, the assertion it contained, the replay-cache commit, and the consumer stage.
+ */
+export interface EncryptedResponseReport {
+  /** The `EncryptedAssertion` element as received, before any decryption. */
+  cipher: string;
+  /** Alias for `cipher`. */
+  cipherText: string;
+  /** A stable digest of `cipher`. */
+  cipherDigest: string;
+  /** Alias for `cipherDigest`. */
+  ciphertextDigest: string;
+  /** The `EncryptedData` element selected for decryption. */
+  encryptedData: string | null;
+  /** A stable digest of `encryptedData`. */
+  encryptedDataDigest: string | null;
+  /** The `EncryptedAssertion` element's XML ID, when it has one. */
+  encryptedAssertionId: string | null;
+  /** All keys this validation was allowed to use, by public-key fingerprint. */
+  decryptionKeys: string[];
+  /** Generation identity of the complete key set frozen for this validation. */
+  decryptionKeyGeneration: string | null;
+  /** Alias for `decryptionKeyGeneration`. */
+  keyGeneration: string | null;
+  /** Alias for `decryptionKeyGeneration`. */
+  decryptKeyGeneration: string | null;
+  /** Fingerprint of the key that decrypted the ciphertext, when one did. */
+  decryptKey: string | null;
+  /** Alias for `decryptKey`. */
+  keyFingerprint: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKey: string | null;
+  /** Alias for `decryptKey`. */
+  decryptKeyFingerprint: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKeyFingerprint: string | null;
+  /** The `EncryptedKey` element's XML ID, when it has one. */
+  encryptedKeyId: string | null;
+  /** The selected `EncryptedKey`'s key transport algorithm. */
+  keyEncryptionAlgorithm: string | null;
+  /** The selected `EncryptedKey`'s OAEP digest algorithm, when it has one. */
+  keyEncryptionDigest: string | null;
+  /** The selected `EncryptedData`'s content encryption algorithm. */
+  contentEncryptionAlgorithm: string | null;
+  /**
+   * The assertion XML after a signature covered the ciphertext or the assertion. Null on a
+   * rejection, where only `assertionId` and `assertionDigest` are reported.
+   */
+  assertion: string | null;
+  /** The assertion's XML ID, when it has one. */
+  assertionId: string | null;
+  /** A stable digest of `assertion`. */
+  assertionDigest: string | null;
+  /** A stable digest of the assertion's `NameID`. */
+  nameIdDigest: string | null;
+  /** Alias for `nameIdDigest`. */
+  nameIDDigest: string | null;
+  /** The replay-cache transaction for this assertion. */
+  cache: {
+    state: EncryptedResponseCacheState;
+    key: string | null;
+    error: string | null;
+  };
+  /** Alias for `cache.state`. */
+  cacheState: EncryptedResponseCacheState;
+  /** Alias for `cache.state`. */
+  cacheStatus: EncryptedResponseCacheState;
+  /** Alias for `cache.key`. */
+  cacheKey: string | null;
+  /** Whether decryption produced an assertion. */
+  decrypted: boolean;
+  /** Whether a signature covered the ciphertext or the decrypted assertion. */
+  signatureVerified: boolean;
+  /** The stage reached by this validation. */
+  stage: EncryptedResponseStage;
+  /** Alias for `stage`. */
+  validationStage: EncryptedResponseStage;
+  /** The stage that rejected the message, or null while it has not been rejected. */
+  failureStage: EncryptedResponseStage | null;
+}
+
+/**
  * These are SAML options that must be provided to construct a new SAML Strategy
  */
 export interface MandatorySamlOptions {
@@ -302,7 +417,7 @@ export interface AttributeConsumingService {
 export interface SamlOptions extends Partial<SamlSigningOptions>, MandatorySamlOptions {
   // Core
   entryPoint?: string;
-  decryptionPvk?: string | Buffer;
+  decryptionPvk?: DecryptionPvkOption;
 
   // Additional SAML behaviors
   additionalParams: Record<string, string>;
@@ -449,6 +564,79 @@ export interface Profile {
    * version; use `getAssertionXml()` or `getAssertion()`.
    */
   getSamlResponseXml?(): string;
+  /**
+   * The ciphertext, decryption key, assertion and stage that authenticated this profile. Set only
+   * for a response whose assertion arrived as an `EncryptedAssertion`.
+   */
+  encryptedResponse?: EncryptedResponseReport;
+  /** Alias for `encryptedResponse`. */
+  decryption?: EncryptedResponseReport;
+  /** The `EncryptedAssertion` element as received. */
+  cipher?: string;
+  /** Alias for `cipher`. */
+  cipherText?: string;
+  /** A stable digest of `cipher`. */
+  cipherDigest?: string;
+  /** Alias for `cipherDigest`. */
+  ciphertextDigest?: string;
+  /** The `EncryptedData` element selected for decryption. */
+  encryptedData?: string | null;
+  /** The `EncryptedAssertion` element's XML ID. */
+  encryptedAssertionId?: string | null;
+  /** All keys this validation was allowed to use, by public-key fingerprint. */
+  decryptionKeys?: string[];
+  /** Generation identity of the decryption key set frozen for this profile. */
+  decryptionKeyGeneration?: string | null;
+  /** Alias for `decryptionKeyGeneration`. */
+  keyGeneration?: string | null;
+  /** Alias for `decryptionKeyGeneration`. */
+  decryptKeyGeneration?: string | null;
+  /** Fingerprint of the key that decrypted the ciphertext. */
+  decryptKey?: string | null;
+  /** Alias for `decryptKey`. */
+  keyFingerprint?: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKey?: string | null;
+  /** Alias for `decryptKey`. */
+  decryptKeyFingerprint?: string | null;
+  /** Alias for `decryptKey`. */
+  decryptionKeyFingerprint?: string | null;
+  /** The selected `EncryptedKey` element's XML ID. */
+  encryptedKeyId?: string | null;
+  /** The selected `EncryptedKey`'s key transport algorithm. */
+  keyEncryptionAlgorithm?: string | null;
+  /** The selected `EncryptedKey`'s OAEP digest algorithm. */
+  keyEncryptionDigest?: string | null;
+  /** The selected `EncryptedData`'s content encryption algorithm. */
+  contentEncryptionAlgorithm?: string | null;
+  /** The verified assertion XML. */
+  assertion?: string | null;
+  /** The verified assertion's XML ID. */
+  assertionId?: string | null;
+  /** A stable digest of `assertion`. */
+  assertionDigest?: string | null;
+  /** A stable digest of the assertion's `NameID`. */
+  nameIdDigest?: string | null;
+  /** Alias for `nameIdDigest`. */
+  nameIDDigest?: string | null;
+  /** The state of the assertion's replay record. */
+  cacheState?: EncryptedResponseCacheState;
+  /** Alias for `cacheState`. */
+  cacheStatus?: EncryptedResponseCacheState;
+  /** The replay record's cache key. */
+  cacheKey?: string | null;
+  /** Whether decryption produced an assertion. */
+  decrypted?: boolean;
+  /** Whether a signature covered the ciphertext or the decrypted assertion. */
+  signatureVerified?: boolean;
+  /** The stage that produced this profile. */
+  validationStage?: EncryptedResponseStage;
+  /** Alias for `validationStage`. */
+  verificationStage?: EncryptedResponseStage;
+  /** Alias for `validationStage`. */
+  stage?: EncryptedResponseStage;
+  /** The stage that rejected the message, or null while it has not been rejected. */
+  failureStage?: EncryptedResponseStage | null;
   [attributeName: string]: unknown; // arbitrary `AttributeValue`s
 }
 

@@ -6,7 +6,14 @@ import * as util from "util";
 import * as zlib from "zlib";
 import * as algorithms from "./algorithms";
 import { DEFAULT_IDENTIFIER_FORMAT, DEFAULT_WANT_ASSERTIONS_SIGNED } from "./constants";
-import { generateUniqueId, keyInfoToPem, privateKeyToPem } from "./crypto";
+import {
+  decryptionPvkFingerprint,
+  decryptionPvkGeneration,
+  generateUniqueId,
+  keyInfoToPem,
+  privateKeyToPem,
+  sha256Digest,
+} from "./crypto";
 import { dateStringToTimestamp, generateInstant } from "./date-time";
 import { warnIfRequestExtensionsInvalid } from "./extensions";
 import { InMemoryCacheProvider } from "./in-memory-cache-provider";
@@ -21,6 +28,9 @@ import {
   AuthOptions,
   AuthorizeRequestXML,
   CacheProvider,
+  DecryptionPvkOption,
+  EncryptedResponseReport,
+  EncryptedResponseStage,
   IdpCertCallback,
   isValidSamlSigningOptions,
   LogoutRequestXML,
@@ -42,7 +52,7 @@ import { assertBooleanIfPresent, assertRequired } from "./utility";
 import {
   buildXml2JsObject,
   buildXmlBuilderObject,
-  decryptXml,
+  decryptXmlWithKeys,
   getNameIdAsync,
   getVerifiedXml,
   parseDomFromString,
@@ -147,6 +157,244 @@ function assertOneIssuer(issuers: (string | null | undefined)[]): void {
     throw new Error(`Expected one SAML issuer, received ${issuers.length}: ${issuers.join(", ")}`);
   }
 }
+
+const snapshotDecryptionPvk = (
+  option: DecryptionPvkOption | undefined,
+): DecryptionPvkOption | undefined => {
+  if (option == null) {
+    return option;
+  }
+  if (Buffer.isBuffer(option)) {
+    return Buffer.from(option);
+  }
+  if (Array.isArray(option)) {
+    return option.map((key) => (Buffer.isBuffer(key) ? Buffer.from(key) : key));
+  }
+  return option;
+};
+
+const decryptionKeyFingerprints = (option: DecryptionPvkOption | undefined): string[] => {
+  if (option == null) {
+    return [];
+  }
+  const keys = Array.isArray(option) ? option : [option];
+  const fingerprints: string[] = [];
+  for (const key of keys) {
+    try {
+      fingerprints.push(decryptionPvkFingerprint(key));
+    } catch {
+      // Decryption reports an unusable key if no other candidate succeeds.
+    }
+  }
+  return fingerprints;
+};
+
+const decryptionKeyGenerationOf = (option: DecryptionPvkOption | undefined): string | null => {
+  try {
+    const fingerprints = decryptionKeyFingerprints(option);
+    return fingerprints.length === 0 ? null : decryptionPvkGeneration(fingerprints);
+  } catch {
+    return null;
+  }
+};
+
+const elementId = (element: Element): string | null => {
+  const id = element.getAttribute("ID") ?? element.getAttribute("Id");
+  return id == null || id === "" ? null : id;
+};
+
+const createEncryptedResponseReport = (
+  encryptedAssertion: Element,
+): EncryptedResponseReport => {
+  const cipher = encryptedAssertion.toString();
+  const cipherDigest = sha256Digest(cipher);
+  return {
+    cipher,
+    cipherText: cipher,
+    cipherDigest,
+    ciphertextDigest: cipherDigest,
+    encryptedData: null,
+    encryptedDataDigest: null,
+    encryptedAssertionId: elementId(encryptedAssertion),
+    decryptionKeys: [],
+    decryptionKeyGeneration: null,
+    keyGeneration: null,
+    decryptKeyGeneration: null,
+    decryptKey: null,
+    keyFingerprint: null,
+    decryptionKey: null,
+    decryptKeyFingerprint: null,
+    decryptionKeyFingerprint: null,
+    encryptedKeyId: null,
+    keyEncryptionAlgorithm: null,
+    keyEncryptionDigest: null,
+    contentEncryptionAlgorithm: null,
+    assertion: null,
+    assertionId: null,
+    assertionDigest: null,
+    nameIdDigest: null,
+    nameIDDigest: null,
+    cache: { state: "not-configured", key: null, error: null },
+    cacheState: "not-configured",
+    cacheStatus: "not-configured",
+    cacheKey: null,
+    decrypted: false,
+    signatureVerified: false,
+    stage: "admission",
+    validationStage: "admission",
+    failureStage: null,
+  };
+};
+
+const recordDecryptionCandidates = (
+  report: EncryptedResponseReport,
+  option: DecryptionPvkOption | undefined,
+): void => {
+  const fingerprints = decryptionKeyFingerprints(option);
+  report.decryptionKeys = fingerprints;
+  report.decryptionKeyGeneration =
+    fingerprints.length === 0 ? null : decryptionPvkGeneration(fingerprints);
+  report.keyGeneration = report.decryptionKeyGeneration;
+  report.decryptKeyGeneration = report.decryptionKeyGeneration;
+};
+
+const applyEncryptedResponseReport = (
+  profile: Profile,
+  report: EncryptedResponseReport,
+): void => {
+  Object.assign(profile, {
+    encryptedResponse: report,
+    decryption: report,
+    cipher: report.cipher,
+    cipherText: report.cipherText,
+    cipherDigest: report.cipherDigest,
+    ciphertextDigest: report.ciphertextDigest,
+    encryptedData: report.encryptedData,
+    encryptedAssertionId: report.encryptedAssertionId,
+    decryptionKeys: report.decryptionKeys,
+    decryptionKeyGeneration: report.decryptionKeyGeneration,
+    keyGeneration: report.decryptionKeyGeneration,
+    decryptKeyGeneration: report.decryptKeyGeneration,
+    decryptKey: report.decryptKey,
+    keyFingerprint: report.decryptKey,
+    decryptionKey: report.decryptionKey,
+    decryptKeyFingerprint: report.decryptKeyFingerprint,
+    decryptionKeyFingerprint: report.decryptionKeyFingerprint,
+    encryptedKeyId: report.encryptedKeyId,
+    keyEncryptionAlgorithm: report.keyEncryptionAlgorithm,
+    keyEncryptionDigest: report.keyEncryptionDigest,
+    contentEncryptionAlgorithm: report.contentEncryptionAlgorithm,
+    assertion: report.assertion,
+    assertionId: report.assertionId,
+    assertionDigest: report.assertionDigest,
+    nameIdDigest: report.nameIdDigest,
+    nameIDDigest: report.nameIDDigest,
+    cacheState: report.cache.state,
+    cacheStatus: report.cache.state,
+    cacheKey: report.cache.key,
+    decrypted: report.decrypted,
+    signatureVerified: report.signatureVerified,
+    stage: report.stage,
+    validationStage: report.validationStage,
+    verificationStage: report.validationStage,
+    failureStage: report.failureStage,
+  });
+};
+
+const attachEncryptedResponseReport = (
+  error: unknown,
+  report: EncryptedResponseReport,
+): void => {
+  if (typeof error !== "object" || error == null) {
+    return;
+  }
+  try {
+    Object.assign(error, {
+      encryptedResponse: report,
+      decryption: report,
+      report,
+      cipher: report.cipher,
+      cipherText: report.cipherText,
+      cipherDigest: report.cipherDigest,
+      ciphertextDigest: report.ciphertextDigest,
+      encryptedData: report.encryptedData,
+      encryptedAssertionId: report.encryptedAssertionId,
+      decryptionKeys: report.decryptionKeys,
+      decryptionKeyGeneration: report.decryptionKeyGeneration,
+      keyGeneration: report.decryptionKeyGeneration,
+      decryptKeyGeneration: report.decryptKeyGeneration,
+      decryptKey: report.decryptKey,
+      keyFingerprint: report.decryptKey,
+      decryptionKey: report.decryptionKey,
+      decryptKeyFingerprint: report.decryptKeyFingerprint,
+      decryptionKeyFingerprint: report.decryptionKeyFingerprint,
+      encryptedKeyId: report.encryptedKeyId,
+      keyEncryptionAlgorithm: report.keyEncryptionAlgorithm,
+      keyEncryptionDigest: report.keyEncryptionDigest,
+      contentEncryptionAlgorithm: report.contentEncryptionAlgorithm,
+      assertion: report.assertion,
+      assertionId: report.assertionId,
+      assertionDigest: report.assertionDigest,
+      nameIdDigest: report.nameIdDigest,
+      nameIDDigest: report.nameIDDigest,
+      cacheState: report.cache.state,
+      cacheStatus: report.cache.state,
+      cacheKey: report.cache.key,
+      decrypted: report.decrypted,
+      signatureVerified: report.signatureVerified,
+      stage: report.stage,
+      validationStage: report.validationStage,
+      verificationStage: report.validationStage,
+      failureStage: report.failureStage,
+    });
+  } catch {
+    // A non-extensible error still carries its original message.
+  }
+};
+
+const normalizedAssertionXml = async (xml: string): Promise<string> => {
+  const doc = await parseDomFromString(xml);
+  return doc.documentElement.toString();
+};
+
+const assertionXmlFromVerifiedXml = async (verifiedXml: string): Promise<string | null> => {
+  const doc = await parseDomFromString(verifiedXml);
+  const root = doc.documentElement;
+  if (root.localName === "Assertion") {
+    return root.toString();
+  }
+  if (root.localName === "Response") {
+    const assertions = xpath.selectElements(root, "./*[local-name()='Assertion']");
+    return assertions.length === 1 ? assertions[0].toString() : null;
+  }
+  return null;
+};
+
+interface AssertionIdentity {
+  id: string | null;
+  issuer: string;
+  nameId: string | null;
+  nameIdDigest: string | null;
+  replayKey: string | null;
+  digest: string;
+}
+
+const readAssertionIdentityAsync = async (assertionXml: string): Promise<AssertionIdentity> => {
+  const doc: XMLOutput = await parseXml2JsFromString(assertionXml);
+  const assertion: XMLOutput | undefined = doc.Assertion;
+  const id: string | null = assertion?.$?.ID ?? null;
+  const issuer: string = assertion?.Issuer?.[0]?._ ?? "";
+  const nameIdValue: string | undefined = assertion?.Subject?.[0]?.NameID?.[0]?._;
+  const nameId: string | null = nameIdValue == null || nameIdValue === "" ? null : nameIdValue;
+  return {
+    id,
+    issuer,
+    nameId,
+    nameIdDigest: nameId == null ? null : sha256Digest(nameId),
+    replayKey: id == null ? null : assertionReplayKey(issuer, id),
+    digest: sha256Digest(assertionXml),
+  };
+};
 
 // Compared as parsed URLs, so the case of the scheme and host and an explicit default port don't
 // count, while the path does, trailing slash included.
@@ -256,13 +504,43 @@ function assertionAcceptedUntilMs(
   return limitsMs.length === 0 ? null : Math.min(...limitsMs) + acceptedClockSkewMs;
 }
 
-class ReplayedAssertionError extends Error {}
+class ReplayedAssertionError extends Error {
+  constructor(
+    message: string,
+    public readonly cacheKey: string,
+  ) {
+    super(message);
+  }
+}
+
+// A cache write that fails is not proof that no record exists. Keep a process-local recovery
+// marker for providers that share both a cache and this process, and write a best-effort tombstone
+// through `saveAsync` so a restart with the same persistent cache still cannot accept the same
+// assertion as a new login.
+const pendingReplayRecords = new WeakMap<CacheProvider, Map<string, number>>();
+
+const pendingReplayRecord = (
+  cacheProvider: CacheProvider,
+): Map<string, number> => {
+  let records = pendingReplayRecords.get(cacheProvider);
+  if (records == null) {
+    records = new Map<string, number>();
+    pendingReplayRecords.set(cacheProvider, records);
+  }
+  return records;
+};
+
+const assertionReplayKey = (issuer: string, id: string): string =>
+  JSON.stringify(["assertion", issuer, id]);
 
 // SAML profiles §4.1.4.5: the SP remembers the ID of each assertion it accepts for as long as that
 // assertion would be valid. It is recorded before the checks that can still reject the assertion, so
 // one rejected as not yet valid cannot be presented again once it is.
 // https://docs.oasis-open.org/security/saml/v2.0/saml-profiles-2.0-os.pdf
-async function recordAssertionAsync(assertionXml: string, options: SamlOptions): Promise<void> {
+async function recordAssertionAsync(
+  assertionXml: string,
+  options: SamlOptions,
+): Promise<"committed" | "expired"> {
   const doc: XMLOutput = await parseXml2JsFromString(assertionXml);
   const assertion: XMLOutput = doc.Assertion;
   const id = assertion.$?.ID;
@@ -280,15 +558,39 @@ async function recordAssertionAsync(assertionXml: string, options: SamlOptions):
     );
   }
   if (acceptedUntilMs <= new Date().getTime()) {
-    return; // already expired, which the checks that follow reject
+    return "expired"; // already expired, which the checks that follow reject
   }
 
   // Kept apart from request IDs, which are stored as they are, and from other identity providers'.
-  const key = JSON.stringify(["assertion", assertion.Issuer?.[0]._ ?? "", id]);
+  const key = assertionReplayKey(assertion.Issuer?.[0]._ ?? "", id);
   // The constructor refuses a cacheProvider without saveIfAbsentAsync while this option is on.
-  const cacheProvider = options.cacheProvider as Required<Pick<CacheProvider, "saveIfAbsentAsync">>;
-  if (!(await cacheProvider.saveIfAbsentAsync(key, generateInstant(), acceptedUntilMs))) {
-    throw new ReplayedAssertionError(`The assertion ${id} has already been received`);
+  const cacheProvider = options.cacheProvider as CacheProvider &
+    Required<Pick<CacheProvider, "saveIfAbsentAsync">>;
+  const pending = pendingReplayRecord(cacheProvider);
+  const pendingUntil = pending.get(key);
+  if (pendingUntil != null) {
+    if (pendingUntil > new Date().getTime()) {
+      throw new ReplayedAssertionError(`The assertion ${id} has already been received`, key);
+    }
+    pending.delete(key);
+  }
+
+  try {
+    if (!(await cacheProvider.saveIfAbsentAsync(key, generateInstant(), acceptedUntilMs))) {
+      throw new ReplayedAssertionError(`The assertion ${id} has already been received`, key);
+    }
+    return "committed";
+  } catch (error) {
+    if (error instanceof ReplayedAssertionError) {
+      throw error;
+    }
+    pending.set(key, acceptedUntilMs);
+    try {
+      await cacheProvider.saveAsync(key, generateInstant());
+    } catch {
+      // The in-process marker above is the remaining recovery boundary.
+    }
+    throw error;
   }
 }
 
@@ -476,6 +778,19 @@ class SAML {
   constructor(ctorOptions: SamlConfig) {
     this.options = this.initialize(ctorOptions);
     this.cacheProvider = this.options.cacheProvider;
+  }
+
+  /**
+   * The generation identity of the currently configured decryption key set. A validation freezes
+   * this identity at admission and reports the frozen value on its profile.
+   */
+  get decryptionKeyGeneration(): string | null {
+    return decryptionKeyGenerationOf(this.options.decryptionPvk);
+  }
+
+  /** Alias for `decryptionKeyGeneration`. */
+  get decryptionPvkGeneration(): string | null {
+    return this.decryptionKeyGeneration;
   }
 
   initialize(ctorOptions: SamlConfig): SamlOptions {
@@ -1184,8 +1499,11 @@ class SAML {
 
         const encryptedAssertionXml = encryptedAssertions[0].toString();
 
-        const decryptedXml = await decryptXml(encryptedAssertionXml, this.options.decryptionPvk);
-        const decryptedDoc = await parseDomFromString(decryptedXml);
+        const decrypted = await decryptXmlWithKeys(
+          encryptedAssertionXml,
+          this.options.decryptionPvk,
+        );
+        const decryptedDoc = await parseDomFromString(decrypted.xml);
         const decryptedAssertion = decryptedDoc.documentElement;
         if (decryptedAssertion.localName !== "Assertion") {
           throw new Error("Invalid EncryptedAssertion content");
@@ -1210,10 +1528,28 @@ class SAML {
     let verifiedInResponseTo: string | null = null;
     let verifiedDestination: string | null = null;
     let verifiedAssertionXml: string | null = null;
+    let validationStage: EncryptedResponseStage = "admission";
+    let encryptedResponse: EncryptedResponseReport | null = null;
+    // A caller can rotate `decryptionPvk` while this message is in flight. Freeze the candidate
+    // keys before the first await so one validation cannot combine two key generations.
+    const decryptionPvkAtAdmission = snapshotDecryptionPvk(this.options.decryptionPvk);
 
     try {
       xml = Buffer.from(container.SAMLResponse, "base64").toString("utf8");
       doc = await parseDomFromString(xml);
+
+      const receivedEncryptedAssertions = xpath.selectElements(
+        doc,
+        "/*[local-name()='Response']/*[local-name()='EncryptedAssertion']",
+      );
+      if (receivedEncryptedAssertions.length === 1) {
+        encryptedResponse = createEncryptedResponseReport(receivedEncryptedAssertions[0]);
+        try {
+          recordDecryptionCandidates(encryptedResponse, decryptionPvkAtAdmission);
+        } catch {
+          // Decryption will report the malformed key against the same frozen candidate list.
+        }
+      }
 
       const inResponseToNodes = xpath.selectAttributes(
         doc,
@@ -1229,6 +1565,7 @@ class SAML {
       // Check if this document has a valid top-level signature which applies to the entire XML document
       let validSignature = false; // Use `getVerifiedXml()` to collect the actual verified contents
 
+      validationStage = "verify-signature";
       const responseVerifiedXml = getVerifiedXml(xml, doc.documentElement, pemFiles);
       let assertionVerifiedXml = null;
       let decryptedAssertionVerifiedXml = null;
@@ -1257,53 +1594,126 @@ class SAML {
         throw new Error("Invalid document signature");
       }
 
-      const assertions = xpath.selectElements(
+      const receivedAssertions = xpath.selectElements(
         doc,
         "/*[local-name()='Response']/*[local-name()='Assertion']",
       );
-      const encryptedAssertions = xpath.selectElements(
-        doc,
-        "/*[local-name()='Response']/*[local-name()='EncryptedAssertion']",
-      );
 
-      if (assertions.length + encryptedAssertions.length > 1) {
+      if (receivedAssertions.length + receivedEncryptedAssertions.length > 1) {
         // There's no reason I know of that we want to handle multiple assertions, and it seems like a
         //   potential risk vector for signature scope issues, so treat this as an invalid signature
         throw new Error("Invalid signature: multiple assertions");
       }
 
+      // A signed Response is the source of truth for which assertion was delivered. Reading the
+      // received DOM after verifying the Response would let an attacker choose a different
+      // `EncryptedAssertion` from the one the signature covers.
+      const assertionSource = responseVerifiedXml && receivedEncryptedAssertions.length === 1
+        ? await parseDomFromString(responseVerifiedXml)
+        : doc;
+      const assertions = xpath.selectElements(
+        assertionSource,
+        "/*[local-name()='Response']/*[local-name()='Assertion']",
+      );
+      const encryptedAssertions = xpath.selectElements(
+        assertionSource,
+        "/*[local-name()='Response']/*[local-name()='EncryptedAssertion']",
+      );
+      if (assertions.length + encryptedAssertions.length > 1) {
+        throw new Error("Invalid signature: multiple assertions");
+      }
+      if (encryptedAssertions.length !== 1) {
+        encryptedResponse = null;
+      }
+
       if (assertions.length == 1) {
         if (this.options.wantAssertionsSigned || !validSignature) {
-          assertionVerifiedXml = getVerifiedXml(xml, assertions[0], pemFiles);
+          assertionVerifiedXml = getVerifiedXml(
+            responseVerifiedXml ?? xml,
+            assertions[0],
+            pemFiles,
+          );
           if (!assertionVerifiedXml) {
             throw new Error("Invalid signature");
           }
         }
       }
 
+      let decryptedAssertionXml: string | null = null;
       if (encryptedAssertions.length == 1) {
-        assertRequired(this.options.decryptionPvk, "No decryption key for encrypted SAML response");
+        validationStage = "decrypt";
+        assertRequired(
+          decryptionPvkAtAdmission,
+          "No decryption key for encrypted SAML response",
+        );
 
         const encryptedAssertionXml = encryptedAssertions[0].toString();
+        if (encryptedResponse == null || encryptedResponse.cipher !== encryptedAssertionXml) {
+          encryptedResponse = createEncryptedResponseReport(encryptedAssertions[0]);
+        }
+        assertRequired(encryptedResponse, "Invalid EncryptedAssertion content");
+        recordDecryptionCandidates(encryptedResponse, decryptionPvkAtAdmission);
+        if (encryptedResponse.decryptionKeys.length === 1) {
+          encryptedResponse.decryptKey = encryptedResponse.decryptionKeys[0];
+          encryptedResponse.keyFingerprint = encryptedResponse.decryptionKeys[0];
+          encryptedResponse.decryptionKey = encryptedResponse.decryptionKeys[0];
+          encryptedResponse.decryptKeyFingerprint = encryptedResponse.decryptionKeys[0];
+          encryptedResponse.decryptionKeyFingerprint = encryptedResponse.decryptionKeys[0];
+        }
 
-        const decryptedXml = await decryptXml(encryptedAssertionXml, this.options.decryptionPvk);
+        const decrypted = await decryptXmlWithKeys(
+          encryptedAssertionXml,
+          decryptionPvkAtAdmission,
+        );
+        encryptedResponse.encryptedData = decrypted.encryptedDataXml;
+        encryptedResponse.encryptedDataDigest =
+          decrypted.encryptedDataXml == null ? null : sha256Digest(decrypted.encryptedDataXml);
+        encryptedResponse.decryptKey = decrypted.decryptionKeyFingerprint;
+        encryptedResponse.keyFingerprint = decrypted.decryptionKeyFingerprint;
+        encryptedResponse.decryptionKey = decrypted.decryptionKeyFingerprint;
+        encryptedResponse.decryptKeyFingerprint = decrypted.decryptionKeyFingerprint;
+        encryptedResponse.decryptionKeyFingerprint = decrypted.decryptionKeyFingerprint;
+        encryptedResponse.encryptedKeyId = decrypted.encryptedKeyId;
+        encryptedResponse.keyEncryptionAlgorithm = decrypted.keyEncryptionAlgorithm;
+        encryptedResponse.keyEncryptionDigest = decrypted.keyEncryptionDigest;
+        encryptedResponse.contentEncryptionAlgorithm = decrypted.contentEncryptionAlgorithm;
         warnIfDecryptionWillFailInNextMajor(encryptedAssertions[0]);
-        const decryptedDoc = await parseDomFromString(decryptedXml);
+        const decryptedDoc = await parseDomFromString(decrypted.xml);
         const decryptedAssertions = xpath.selectElements(
           decryptedDoc,
           "/*[local-name()='Assertion']",
         );
         if (decryptedAssertions.length != 1) throw new Error("Invalid EncryptedAssertion content");
+        decryptedAssertionXml = decryptedAssertions[0].toString();
+        encryptedResponse.decrypted = true;
+        try {
+          const decryptedIdentity = await readAssertionIdentityAsync(decryptedAssertionXml);
+          encryptedResponse.assertionId = decryptedIdentity.id;
+          encryptedResponse.assertionDigest = decryptedIdentity.digest;
+          encryptedResponse.nameIdDigest = decryptedIdentity.nameIdDigest;
+          encryptedResponse.nameIDDigest = decryptedIdentity.nameIdDigest;
+        } catch {
+          // The signature check below, or profile processing, reports malformed assertions.
+        }
+        validationStage = "decrypted";
 
         if (this.options.wantAssertionsSigned || !validSignature) {
+          validationStage = "verify-signature";
           decryptedAssertionVerifiedXml = getVerifiedXml(
-            decryptedXml,
+            decrypted.xml,
             decryptedAssertions[0],
             pemFiles,
           );
           if (decryptedAssertionVerifiedXml == null) {
             throw new Error("Invalid signature from encrypted assertion");
           }
+          encryptedResponse.signatureVerified = true;
+          encryptedResponse.assertion = decryptedAssertionVerifiedXml;
+        } else if (responseVerifiedXml != null) {
+          // The Response's signature covers the ciphertext, which is the only source of this
+          // plaintext. No assertion signature is required in this mode.
+          encryptedResponse.signatureVerified = true;
+          encryptedResponse.assertion = decryptedAssertionXml;
         }
       }
 
@@ -1315,21 +1725,83 @@ class SAML {
 
       // double check that there is at least 1 assertion
       if (verifiedXml && assertions.length + encryptedAssertions.length == 1) {
-        const signedAssertion = await this.getSignedAssertion(verifiedXml);
+        let signedAssertion: string | null;
+        if (decryptedAssertionXml != null) {
+          // Use the plaintext whose ciphertext (or assertion) was verified above. Asking
+          // `getSignedAssertion` to decrypt again could pick another `EncryptedKey` and submit a
+          // DOM that no signature covered.
+          signedAssertion = decryptedAssertionVerifiedXml ?? decryptedAssertionXml;
+        } else {
+          signedAssertion = await this.getSignedAssertion(verifiedXml);
+          const expectedAssertionXml = await assertionXmlFromVerifiedXml(verifiedXml);
+          if (
+            signedAssertion != null &&
+            expectedAssertionXml != null &&
+            (await normalizedAssertionXml(signedAssertion)) !==
+              (await normalizedAssertionXml(expectedAssertionXml))
+          ) {
+            throw new Error("Cannot obtain assertion from signed data");
+          }
+        }
 
         if (signedAssertion == null) {
           throw new Error("Cannot obtain assertion from signed data");
         }
         verifiedAssertionXml = signedAssertion;
-        if (this.options.rejectReplayedAssertions) {
-          await recordAssertionAsync(signedAssertion, this.options);
+        let assertionIdentity: AssertionIdentity | null = null;
+        if (encryptedResponse != null) {
+          assertionIdentity = await readAssertionIdentityAsync(signedAssertion);
+          encryptedResponse.assertionId = assertionIdentity.id;
+          encryptedResponse.assertionDigest = assertionIdentity.digest;
+          encryptedResponse.nameIdDigest = assertionIdentity.nameIdDigest;
+          encryptedResponse.nameIDDigest = assertionIdentity.nameIdDigest;
         }
+        validationStage = "replay-cache";
+        if (this.options.rejectReplayedAssertions) {
+          if (encryptedResponse != null) {
+            encryptedResponse.cache = {
+              state: "pending",
+              key: assertionIdentity?.replayKey ?? null,
+              error: null,
+            };
+            encryptedResponse.cacheState = "pending";
+            encryptedResponse.cacheStatus = "pending";
+            encryptedResponse.cacheKey = assertionIdentity?.replayKey ?? null;
+          }
+          try {
+            const cacheState = await recordAssertionAsync(signedAssertion, this.options);
+            if (encryptedResponse != null) {
+              encryptedResponse.cache.state =
+                cacheState === "committed" ? "committed" : "not-configured";
+              encryptedResponse.cacheState = encryptedResponse.cache.state;
+              encryptedResponse.cacheStatus = encryptedResponse.cache.state;
+            }
+          } catch (error) {
+            if (encryptedResponse != null) {
+              encryptedResponse.cache.state =
+                error instanceof ReplayedAssertionError ? "replayed" : "failed";
+              encryptedResponse.cache.error =
+                error instanceof Error ? error.message : String(error);
+              encryptedResponse.cacheState = encryptedResponse.cache.state;
+              encryptedResponse.cacheStatus = encryptedResponse.cache.state;
+            }
+            throw error;
+          }
+        }
+        validationStage = "profile";
         const result = await this.processValidlySignedAssertionAsync(
           signedAssertion,
           xml,
           responseVerifiedXml ? verifiedInResponseTo : inResponseTo,
           responseVerifiedXml != null,
         );
+        if (
+          encryptedResponse != null &&
+          assertionIdentity?.nameId != null &&
+          result.profile.nameID !== assertionIdentity.nameId
+        ) {
+          throw new Error("The assertion NameID changed while the assertion was being processed");
+        }
         // Consumed here, not in the overridable method, whose inResponseToIsVerified an override
         // written before that parameter drops. Unless the Response is signed, only the assertion
         // can name the request it answers.
@@ -1349,6 +1821,16 @@ class SAML {
             "Response",
             verifiedDestination,
           );
+        }
+        if (
+          encryptedResponse != null &&
+          decryptedAssertionXml != null &&
+          result.profile != null
+        ) {
+          encryptedResponse.stage = "complete";
+          encryptedResponse.validationStage = "complete";
+          encryptedResponse.failureStage = null;
+          applyEncryptedResponseReport(result.profile, encryptedResponse);
         }
         return result;
       }
@@ -1432,6 +1914,21 @@ class SAML {
         }
       }
     } catch (err) {
+      if (encryptedResponse != null) {
+        const failureStage =
+          err instanceof ReplayedAssertionError ? "replay-cache" : validationStage;
+        encryptedResponse.stage = failureStage;
+        encryptedResponse.validationStage = failureStage;
+        encryptedResponse.failureStage = failureStage;
+        if (validationStage === "replay-cache") {
+          encryptedResponse.cache.state =
+            err instanceof ReplayedAssertionError ? "replayed" : "failed";
+          encryptedResponse.cache.error = err instanceof Error ? err.message : String(err);
+          encryptedResponse.cacheState = encryptedResponse.cache.state;
+          encryptedResponse.cacheStatus = encryptedResponse.cache.state;
+        }
+        attachEncryptedResponseReport(err, encryptedResponse);
+      }
       debugLog.enabled && debugLog("validatePostResponse resulted in an error: %s", err);
       // A failure the IdP signed means it answered the request, so no other response is coming.
       // An unsigned one proves nothing about the request it names, so that request stays pending.
@@ -1519,6 +2016,7 @@ class SAML {
       legacyOriginalQuery,
     );
     const { samlMessageType, samlMessage, signed } = parameters;
+    const decryptionPvkAtAdmission = snapshotDecryptionPvk(this.options.decryptionPvk);
 
     const data = Buffer.from(samlMessage, "base64");
     const inflated = await inflateRawAsync(data);
@@ -1546,7 +2044,11 @@ class SAML {
         await consumeInResponseToAsync(this.cacheProvider, signedInResponseTo);
       }
     }
-    const result = await this.processValidlySignedSamlLogoutAsync(doc, dom);
+    const result = await this.processValidlySignedSamlLogoutAsync(
+      doc,
+      dom,
+      decryptionPvkAtAdmission,
+    );
     if (signed) {
       const messageName = samlMessageType === "SAMLRequest" ? "LogoutRequest" : "LogoutResponse";
       warnIfDestinationIsNot(
@@ -2078,6 +2580,7 @@ class SAML {
     },
   ): Promise<{ profile: Profile; loggedOut: boolean }> {
     warnIgnoredInjectedDependencies(legacyInjectedDependencies);
+    const decryptionPvkAtAdmission = snapshotDecryptionPvk(this.options.decryptionPvk);
     const xml = Buffer.from(container.SAMLRequest, "base64").toString("utf8");
     // The document as received locates the signature; only what that signature covers is read.
     const receivedDom = await parseDomFromString(xml);
@@ -2088,7 +2591,11 @@ class SAML {
     }
     const verifiedDom = await parseDomFromString(verifiedXml);
     const verifiedDoc = await parseXml2JsFromString(verifiedXml);
-    const result = await this.processValidlySignedPostRequestAsync(verifiedDoc, verifiedDom);
+    const result = await this.processValidlySignedPostRequestAsync(
+      verifiedDoc,
+      verifiedDom,
+      decryptionPvkAtAdmission,
+    );
     warnIfDestinationIsNot(
       "logoutCallbackUrl",
       this.options.logoutCallbackUrl,
@@ -2107,6 +2614,7 @@ class SAML {
     this: SAML,
     doc: XMLOutput,
     dom: Document,
+    decryptionPvk?: DecryptionPvkOption | null,
   ): Promise<{ profile: Profile; loggedOut: boolean }> {
     const request = doc.LogoutRequest;
     this.verifyLogoutRequest(doc);
@@ -2123,7 +2631,10 @@ class SAML {
       } else {
         throw new Error("Missing SAML issuer");
       }
-      const nameID = await getNameIdAsync(dom, this.options.decryptionPvk ?? null);
+      const nameID = await getNameIdAsync(
+        dom,
+        decryptionPvk ?? this.options.decryptionPvk ?? null,
+      );
       if (nameID.value) {
         profile.nameID = nameID.value;
         if (nameID.format) {
@@ -2151,6 +2662,7 @@ class SAML {
     this: SAML,
     doc: XMLOutput,
     dom: Document,
+    decryptionPvk?: DecryptionPvkOption | null,
   ): Promise<{ profile: Profile | null; loggedOut: boolean }> {
     const response = doc.LogoutResponse;
     const request = doc.LogoutRequest;
@@ -2158,7 +2670,7 @@ class SAML {
     if (response) {
       return { profile: null, loggedOut: true };
     } else if (request) {
-      return await this.processValidlySignedPostRequestAsync(doc, dom);
+      return await this.processValidlySignedPostRequestAsync(doc, dom, decryptionPvk);
     } else {
       throw new Error("Unknown SAML response message");
     }

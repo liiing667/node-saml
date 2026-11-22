@@ -8,6 +8,7 @@ import * as xmlbuilder from "xmlbuilder";
 import { select, SelectReturnType } from "xpath";
 import * as algorithms from "./algorithms";
 import {
+  DecryptionPvkOption,
   isValidSamlSigningOptions,
   NameID,
   SamlSigningOptions,
@@ -16,7 +17,12 @@ import {
   XmlSignatureLocation,
 } from "./types";
 import { assertRequired } from "./utility";
-import { decryptionPvkToPem, keyInfoToPem, privateKeyToPem } from "./crypto";
+import {
+  decryptionPvkFingerprint,
+  decryptionPvkToPem,
+  keyInfoToPem,
+  privateKeyToPem,
+} from "./crypto";
 
 const debugLog = util.debuglog("node-saml");
 
@@ -45,8 +51,296 @@ export const xpath = {
     selectXPath(elementsXPathTypeGuard, node, xpath),
 };
 
-export const decryptXml = async (xml: string, decryptionPvk: string | Buffer) =>
-  util.promisify(xmlenc.decrypt).bind(xmlenc)(xml, { key: decryptionPvkToPem(decryptionPvk) });
+const xmlEncryptionNamespace = "http://www.w3.org/2001/04/xmlenc#";
+const xmlSignatureNamespace = "http://www.w3.org/2000/09/xmldsig#";
+
+const decryptionKeys = (decryptionPvk: DecryptionPvkOption): Array<string | Buffer> =>
+  Array.isArray(decryptionPvk) ? [...decryptionPvk] : [decryptionPvk];
+
+const encryptedKeyId = (element: Element): string | null => {
+  const id = element.getAttribute("Id") ?? element.getAttribute("ID");
+  return id == null || id === "" ? null : id;
+};
+
+const findEncryptedDataElement = (root: Element): Element | null => {
+  if (root.localName === "EncryptedData") {
+    return root;
+  }
+
+  const encryptedData = xpath.selectElements(
+    root,
+    `.//*[local-name()='EncryptedData' and namespace-uri(.)='${xmlEncryptionNamespace}']`,
+  );
+  if (encryptedData.length > 1) {
+    throw new Error("Invalid EncryptedAssertion content");
+  }
+  if (encryptedData.length === 1) {
+    return encryptedData[0];
+  }
+
+  const localNameMatches = xpath.selectElements(root, ".//*[local-name()='EncryptedData']");
+  if (localNameMatches.length > 1) {
+    throw new Error("Invalid EncryptedAssertion content");
+  }
+  return localNameMatches[0] ?? null;
+};
+
+const findEncryptedKeys = (root: Element, encryptedData: Element): Element[] => {
+  const strictKeyInfos = xpath.selectElements(
+    encryptedData,
+    `./*[local-name()='KeyInfo' and namespace-uri(.)='${xmlSignatureNamespace}']`,
+  );
+  const keyInfos =
+    strictKeyInfos.length > 0
+      ? strictKeyInfos
+      : xpath.selectElements(encryptedData, "./*[local-name()='KeyInfo']");
+  const inlineKeys: Element[] = [];
+  const retrievalMethods: Element[] = [];
+  for (const keyInfo of keyInfos) {
+    const strictInlineKeys = xpath.selectElements(
+      keyInfo,
+      `./*[local-name()='EncryptedKey' and namespace-uri(.)='${xmlEncryptionNamespace}']`,
+    );
+    inlineKeys.push(
+      ...(strictInlineKeys.length > 0
+        ? strictInlineKeys
+        : xpath.selectElements(keyInfo, "./*[local-name()='EncryptedKey']")),
+    );
+    const strictRetrievalMethods = xpath.selectElements(
+      keyInfo,
+      `./*[local-name()='RetrievalMethod' and namespace-uri(.)='${xmlSignatureNamespace}']`,
+    );
+    retrievalMethods.push(
+      ...(strictRetrievalMethods.length > 0
+        ? strictRetrievalMethods
+        : xpath.selectElements(keyInfo, "./*[local-name()='RetrievalMethod']")),
+    );
+  }
+  const detachedKeys: Element[] = [];
+  for (const retrievalMethod of retrievalMethods) {
+    const uri = retrievalMethod.getAttribute("URI");
+    if (!uri?.startsWith("#")) {
+      throw new Error("Invalid EncryptedAssertion content");
+    }
+    if (uri.includes("'") || uri.includes('"')) {
+      throw new Error("Invalid EncryptedAssertion content");
+    }
+    const id = uri.slice(1);
+    if (id === "") {
+      throw new Error("Invalid EncryptedAssertion content");
+    }
+    const strictMatches = xpath
+      .selectElements(
+        root,
+        `./*[local-name()='EncryptedKey' and namespace-uri(.)='${xmlEncryptionNamespace}']`,
+      )
+      .filter((key) => encryptedKeyId(key) === id);
+    const matches =
+      strictMatches.length > 0
+        ? strictMatches
+        : xpath
+            .selectElements(root, "./*[local-name()='EncryptedKey']")
+            .filter((key) => encryptedKeyId(key) === id);
+    if (matches.length > 1) {
+      throw new Error("Invalid EncryptedAssertion content");
+    }
+    detachedKeys.push(...matches);
+  }
+
+  return [...new Set([...inlineKeys, ...detachedKeys])];
+};
+
+const findKeyInfoElement = (encryptedData: Element): Element | undefined =>
+  xpath.selectElements(
+    encryptedData,
+    `./*[local-name()='KeyInfo' and namespace-uri(.)='${xmlSignatureNamespace}']`,
+  )[0] ??
+  xpath.selectElements(encryptedData, "./*[local-name()='KeyInfo']")[0];
+
+const isDescendantOf = (node: Node, ancestor: Element): boolean => {
+  let parent = node.parentNode;
+  while (parent != null) {
+    if (parent === ancestor) {
+      return true;
+    }
+    parent = parent.parentNode;
+  }
+  return false;
+};
+
+const isolateEncryptedKey = async (xml: string, candidateIndex: number): Promise<string> => {
+  const doc = await parseDomFromString(xml);
+  const root = doc.documentElement;
+  const encryptedData = findEncryptedDataElement(root);
+  if (encryptedData == null) {
+    throw new Error("Invalid EncryptedAssertion content");
+  }
+
+  const candidates = findEncryptedKeys(root, encryptedData);
+  const selected = candidates[candidateIndex];
+  if (selected == null) {
+    throw new Error("Invalid EncryptedAssertion content");
+  }
+
+  const allKeys = xpath.selectElements(
+    doc,
+    "//*[local-name()='EncryptedKey']",
+  );
+  for (const key of allKeys) {
+    if (key !== selected) {
+      key.parentNode?.removeChild(key);
+    }
+  }
+
+  // `xml-encryption` otherwise reads the first KeyInfo/EncryptedKey in the document. Move the
+  // selected key under the EncryptedData's KeyInfo and remove RetrievalMethods so this attempt can
+  // only see the algorithm context and wrapped key that belong to `selected`.
+  const keyInfo = findKeyInfoElement(encryptedData);
+  if (keyInfo == null) {
+    throw new Error("Invalid EncryptedAssertion content");
+  }
+  for (const otherKeyInfo of xpath.selectElements(doc, "//*[local-name()='KeyInfo']")) {
+    if (otherKeyInfo !== keyInfo && !isDescendantOf(otherKeyInfo, keyInfo)) {
+      otherKeyInfo.parentNode?.removeChild(otherKeyInfo);
+    }
+  }
+  for (const retrievalMethod of xpath.selectElements(
+    encryptedData,
+    `./*[local-name()='KeyInfo']/*[local-name()='RetrievalMethod']`,
+  )) {
+    retrievalMethod.parentNode?.removeChild(retrievalMethod);
+  }
+  if (selected.parentNode !== keyInfo) {
+    selected.parentNode?.removeChild(selected);
+    keyInfo.appendChild(selected);
+  }
+
+  return new xmldom.XMLSerializer().serializeToString(doc);
+};
+
+export interface XmlDecryptionResult {
+  xml: string;
+  decryptionPvk: string | Buffer;
+  decryptionKeyFingerprint: string;
+  encryptedDataXml: string | null;
+  encryptedKeyId: string | null;
+  keyEncryptionAlgorithm: string | null;
+  keyEncryptionDigest: string | null;
+  contentEncryptionAlgorithm: string | null;
+}
+
+/**
+ * Decrypt XML with one key or a rotation window of keys. Each attempt is isolated to one
+ * `EncryptedKey`, so a failed attempt cannot leave `xml-encryption` reading another key's
+ * algorithm context.
+ */
+export const decryptXmlWithKeys = async (
+  xml: string,
+  decryptionPvk: DecryptionPvkOption,
+): Promise<XmlDecryptionResult> => {
+  const decrypt = util.promisify(xmlenc.decrypt).bind(xmlenc);
+  const keys = decryptionKeys(decryptionPvk);
+  if (keys.length === 0) {
+    throw new Error("No decryption key for encrypted SAML response");
+  }
+
+  const parsedDoc = await parseDomFromString(xml);
+  const parsedRoot = parsedDoc.documentElement;
+  const parsedEncryptedData = findEncryptedDataElement(parsedRoot);
+  const candidates =
+    parsedEncryptedData == null ? [] : findEncryptedKeys(parsedRoot, parsedEncryptedData);
+  const encryptedDataXml = parsedEncryptedData?.toString() ?? null;
+  const contentEncryptionAlgorithm = parsedEncryptedData
+    ? (encryptionMethod(parsedEncryptedData)?.getAttribute("Algorithm") ?? null)
+    : null;
+
+  let lastError: unknown;
+  for (const decryptionKey of keys) {
+    let fingerprint: string;
+    try {
+      fingerprint = decryptionPvkFingerprint(decryptionKey);
+    } catch (error) {
+      lastError = error;
+      continue;
+    }
+
+    if (candidates.length === 0) {
+      try {
+        const decrypted = (await decrypt(xml, {
+          key: decryptionPvkToPem(decryptionKey),
+        })) as string;
+        return {
+          xml: decrypted,
+          decryptionPvk: decryptionKey,
+          decryptionKeyFingerprint: fingerprint,
+          encryptedDataXml,
+          encryptedKeyId: null,
+          keyEncryptionAlgorithm: null,
+          keyEncryptionDigest: null,
+          contentEncryptionAlgorithm,
+        };
+      } catch (error) {
+        lastError = error;
+        continue;
+      }
+    }
+
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+      const candidate = candidates[candidateIndex];
+      const keyMethod = encryptionMethod(candidate);
+      const keyEncryptionAlgorithm = keyMethod?.getAttribute("Algorithm") ?? null;
+      const digestMethod =
+        keyMethod == null
+          ? undefined
+          : (xpath.selectElements(
+              keyMethod,
+              `./*[local-name()='DigestMethod' and namespace-uri(.)='${xmlSignatureNamespace}']`,
+            )[0] ?? xpath.selectElements(keyMethod, "./*[local-name()='DigestMethod']")[0]);
+      const keyEncryptionDigest = digestMethod?.getAttribute("Algorithm") ?? null;
+
+      let isolatedXml: string;
+      try {
+        isolatedXml = await isolateEncryptedKey(xml, candidateIndex);
+      } catch (error) {
+        lastError = error;
+        continue;
+      }
+
+      try {
+        const decrypted = (await decrypt(isolatedXml, {
+          key: decryptionPvkToPem(decryptionKey),
+        })) as string;
+        return {
+          xml: decrypted,
+          decryptionPvk: decryptionKey,
+          decryptionKeyFingerprint: fingerprint,
+          encryptedDataXml,
+          encryptedKeyId: encryptedKeyId(candidate),
+          keyEncryptionAlgorithm,
+          keyEncryptionDigest,
+          contentEncryptionAlgorithm,
+        };
+      } catch (error) {
+        lastError = error;
+        if (debugLog.enabled) {
+          debugLog(
+            "decryption with key %s and EncryptedKey %s failed: %s",
+            fingerprint,
+            encryptedKeyId(candidate) ?? "without an ID",
+            error,
+          );
+        }
+      }
+    }
+  }
+
+  throw lastError ?? new Error("No decryption key for encrypted SAML response");
+};
+
+export const decryptXml = async (
+  xml: string,
+  decryptionPvk: DecryptionPvkOption,
+): Promise<string> => (await decryptXmlWithKeys(xml, decryptionPvk)).xml;
 
 const encryptionMethod = (element: Element): Element | undefined =>
   xpath.selectElements(
@@ -445,7 +739,7 @@ export const promiseWithNameId = async (nameid: Node): Promise<NameID> => {
 
 export const getNameIdAsync = async (
   doc: Node,
-  decryptionPvk: string | Buffer | null,
+  decryptionPvk: DecryptionPvkOption | null,
 ): Promise<NameID> => {
   const nameIds = xpath.selectElements(
     doc,
@@ -476,9 +770,9 @@ export const getNameIdAsync = async (
     if (encryptedData.length !== 1) {
       throw new Error("Invalid LogoutRequest: no EncryptedData element found");
     }
-    const encryptedDataXml = encryptedData[0].toString();
+    const encryptedIdXml = encryptedIds[0].toString();
 
-    const decryptedXml = await decryptXml(encryptedDataXml, decryptionPvk);
+    const decryptedXml = await decryptXml(encryptedIdXml, decryptionPvk);
     warnIfDecryptionWillFailInNextMajor(encryptedIds[0]);
     const decryptedDoc = await parseDomFromString(decryptedXml);
     const decryptedIds = xpath.selectElements(decryptedDoc, "/*[local-name()='NameID']");
