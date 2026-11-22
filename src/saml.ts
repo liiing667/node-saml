@@ -118,9 +118,58 @@ async function consumeRequestIdAsync(
 async function consumeInResponseToAsync(
   cacheProvider: CacheProvider,
   inResponseTo: string | null,
-): Promise<void> {
-  if (inResponseTo != null && (await consumeRequestIdAsync(cacheProvider, inResponseTo)) == null) {
+): Promise<string | null> {
+  if (inResponseTo == null) {
+    return null;
+  }
+  const value = await consumeRequestIdAsync(cacheProvider, inResponseTo);
+  if (value == null) {
     throw new Error("InResponseTo is not valid");
+  }
+  return value;
+}
+
+// A login transaction: the request ID, the RelayState that left with the AuthnRequest, and the
+// callbackUrl the request named. It is stored under the request ID so a response can be tied back
+// to the exact tab/session that started it, and survives a restart when the cache provider is
+// shared and persistent. Logout requests still store a bare instant, hence the two shapes.
+interface PendingLoginRequest {
+  createdAt: string;
+  relayState: string | null;
+  callbackUrl: string;
+}
+
+function serializePendingLoginRequest(pending: PendingLoginRequest): string {
+  return JSON.stringify(pending);
+}
+
+// A bare string is a record written by an older version (or a logout request's instant).
+function parsePendingLoginRequest(value: string): PendingLoginRequest | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingLoginRequest>;
+    if (typeof parsed.createdAt === "string" && typeof parsed.callbackUrl === "string") {
+      return {
+        createdAt: parsed.createdAt,
+        relayState: typeof parsed.relayState === "string" ? parsed.relayState : null,
+        callbackUrl: parsed.callbackUrl,
+      };
+    }
+  } catch {
+    // Not a JSON record.
+  }
+  return null;
+}
+
+// A response only answers the transaction its InResponseTo names when it carries that
+// transaction's RelayState. A mismatched or missing one means the response belongs to another
+// tab/session, and accepting it would log the caller into the wrong account or business.
+function assertRelayStateBelongsToRequest(
+  pending: PendingLoginRequest,
+  receivedRelayState: string | undefined,
+): void {
+  const expected = pending.relayState ?? undefined;
+  if (receivedRelayState !== expected) {
+    throw new Error("RelayState does not match the one the AuthnRequest was issued with");
   }
 }
 
@@ -643,15 +692,12 @@ class SAML {
     this: SAML,
     isPassive: boolean,
     isHttpPostBinding: boolean,
-  ): Promise<string> {
+  ): Promise<{ request: string; requestId: string }> {
     assertRequired(this.options.entryPoint, "entryPoint is required");
 
     const id = this.options.generateUniqueId();
     const instant = generateInstant();
 
-    if (this.mustValidateInResponseTo(true)) {
-      await this.cacheProvider.saveAsync(id, instant);
-    }
     const request: AuthorizeRequestXML = {
       "samlp:AuthnRequest": {
         "@xmlns:samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
@@ -785,7 +831,52 @@ class SAML {
     if (isHttpPostBinding && isValidSamlSigningOptions(this.options)) {
       stringRequest = signAuthnRequestPost(stringRequest, this.options);
     }
-    return stringRequest;
+    return { request: stringRequest, requestId: id };
+  }
+
+  // Freezes the login transaction — request ID, the RelayState that will actually be sent, and
+  // the callbackUrl the AuthnRequest names — under the request ID, before the redirect/form is
+  // handed to the browser. Two tabs then get two independent transactions, and a shared persistent
+  // cache provider keeps each one valid across processes and restarts.
+  protected async saveAuthorizeRequestAsync(
+    requestId: string,
+    relayState: string | null,
+  ): Promise<void> {
+    if (!this.mustValidateInResponseTo(true)) {
+      return;
+    }
+    await this.cacheProvider.saveAsync(
+      requestId,
+      serializePendingLoginRequest({
+        createdAt: generateInstant(),
+        relayState,
+        callbackUrl: this.options.callbackUrl,
+      }),
+    );
+  }
+
+  // The RelayState actually sent: the caller's value, else one already on the entry point's URL.
+  // Mirrors `_requestToUrlAsync`, so the value stored is the value the identity provider echoes.
+  protected resolveAuthorizeRelayState(
+    RelayState: string,
+    overrideParams?: querystring.ParsedUrlQuery,
+  ): string | null {
+    const fromParams = [
+      RelayState,
+      overrideParams?.RelayState,
+      this.options.additionalParams.RelayState,
+      this.options.additionalAuthorizeParams.RelayState,
+    ].find((value) => hasValue(value));
+    if (hasValue(fromParams)) {
+      return String(fromParams);
+    }
+    // generateAuthorizeRequestAsync already asserted entryPoint, but keep this helper from
+    // replacing that message with a URL parse error.
+    if (!hasValue(this.options.entryPoint)) {
+      return null;
+    }
+    const fromEntryPoint = new URL(this.options.entryPoint).searchParams.get("RelayState");
+    return hasValue(fromEntryPoint) ? fromEntryPoint : null;
   }
 
   async _generateLogoutRequest(this: SAML, user: Profile): Promise<string> {
@@ -966,9 +1057,16 @@ class SAML {
     legacyOptions?: AuthOptions,
   ): Promise<string> {
     const options = resolveAuthOptions(hostOrOptions, legacyOptions, "getAuthorizeUrlAsync");
-    const request = await this.generateAuthorizeRequestAsync(this.options.passive, false);
     const operation = "authorize";
     const overrideParams = options ? options.additionalParams || {} : {};
+    const { request, requestId } = await this.generateAuthorizeRequestAsync(
+      this.options.passive,
+      false,
+    );
+    await this.saveAuthorizeRequestAsync(
+      requestId,
+      this.resolveAuthorizeRelayState(RelayState, overrideParams),
+    );
     return await this._requestToUrlAsync(
       request,
       null,
@@ -992,7 +1090,16 @@ class SAML {
     const options = resolveAuthOptions(hostOrOptions, legacyOptions, "getAuthorizeMessageAsync");
     assertRequired(this.options.entryPoint, "entryPoint is required");
 
-    const request = await this.generateAuthorizeRequestAsync(this.options.passive, true);
+    const operation = "authorize";
+    const overrideParams = options ? options.additionalParams || {} : {};
+    const { request, requestId } = await this.generateAuthorizeRequestAsync(
+      this.options.passive,
+      true,
+    );
+    await this.saveAuthorizeRequestAsync(
+      requestId,
+      this.resolveAuthorizeRelayState(RelayState, overrideParams),
+    );
     let buffer: Buffer;
     if (this.options.skipRequestCompression) {
       buffer = Buffer.from(request, "utf8");
@@ -1000,8 +1107,6 @@ class SAML {
       buffer = await deflateRawAsync(request);
     }
 
-    const operation = "authorize";
-    const overrideParams = options ? options.additionalParams || {} : {};
     const additionalParameters = this._getAdditionalParams(RelayState, operation, overrideParams);
     const samlMessage: querystring.ParsedUrlQueryInput = { SAMLRequest: buffer.toString("base64") };
 
@@ -1203,7 +1308,7 @@ class SAML {
 
   async validatePostResponseAsync(
     container: Record<string, string>,
-  ): Promise<{ profile: Profile | null; loggedOut: boolean }> {
+  ): Promise<{ profile: Profile | null; loggedOut: boolean; relayState?: string | undefined }> {
     let xml: string;
     let doc: Document;
     let inResponseTo: string | null = null;
@@ -1333,24 +1438,35 @@ class SAML {
         // Consumed here, not in the overridable method, whose inResponseToIsVerified an override
         // written before that parameter drops. Unless the Response is signed, only the assertion
         // can name the request it answers.
+        let pendingLoginRequest: PendingLoginRequest | null = null;
         if (this.mustValidateInResponseTo(Boolean(inResponseTo))) {
           const answeredRequestId = responseVerifiedXml
             ? verifiedInResponseTo
             : (await getSubjectInResponseTosAsync(signedAssertion)).find(
                 (subjectInResponseTo) => subjectInResponseTo === inResponseTo,
               );
-          await consumeInResponseToAsync(this.cacheProvider, answeredRequestId ?? null);
+          const consumed = await consumeInResponseToAsync(
+            this.cacheProvider,
+            answeredRequestId ?? null,
+          );
+          pendingLoginRequest = parsePendingLoginRequest(consumed);
+          if (pendingLoginRequest != null) {
+            assertRelayStateBelongsToRequest(pendingLoginRequest, container.RelayState);
+          }
         }
         // An unsigned Response's Destination is not verified, so it is not read.
         if (responseVerifiedXml) {
+          const expectedCallbackUrl = pendingLoginRequest?.callbackUrl ?? this.options.callbackUrl;
           warnIfDestinationIsNot(
             "callbackUrl",
-            this.options.callbackUrl,
+            expectedCallbackUrl,
             "Response",
             verifiedDestination,
           );
         }
-        return result;
+        return pendingLoginRequest?.relayState != null
+          ? { ...result, relayState: pendingLoginRequest.relayState }
+          : result;
       }
 
       // With no signature on the root nothing here was verified, and every path below rejects.
@@ -1840,7 +1956,8 @@ class SAML {
               let foundValidInResponseTo = false;
               const result = await this.cacheProvider.getAsync(subjectInResponseTo);
               if (result) {
-                const createdAt = new Date(result);
+                const createdAtValue = parsePendingLoginRequest(result)?.createdAt ?? result;
+                const createdAt = new Date(createdAtValue);
                 if (nowMs < createdAt.getTime() + this.options.requestIdExpirationPeriodMs)
                   foundValidInResponseTo = true;
               }

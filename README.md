@@ -1049,6 +1049,39 @@ unsigned Redirect-binding `LogoutResponse`. None of these can be presented again
 than before: an unsigned `InResponseTo` can be deleted, making the response unsolicited, and an
 unsigned logout message can be forged outright.
 
+### Login transactions and RelayState
+
+While `InResponseTo` is validated, issuing a login with `getAuthorizeUrlAsync`,
+`getAuthorizeMessageAsync`, or `getAuthorizeFormAsync` freezes the whole login transaction under
+the generated request ID:
+
+- the request ID itself;
+- the `RelayState` that is actually sent, including one already on the `entryPoint` URL, or `null`
+  when none is sent;
+- the `callbackUrl` the `AuthnRequest` names as its `AssertionConsumerServiceURL`.
+
+On the callback, the response is accepted only when the `RelayState` it carries is the one frozen
+for the request its `InResponseTo` names. A response that names a pending request but carries
+another `RelayState`, or none when one was issued, is rejected with
+`RelayState does not match the one the AuthnRequest was issued with`, and the request is consumed
+so the swapped response cannot be retried. This keeps two logins started in two browser tabs — for
+two accounts or two businesses — independent: a response answered for one tab cannot establish a
+session in the other, which is otherwise possible because the SP only sees an opaque echoed
+`RelayState` and a signed response that does not bind it.
+
+`validatePostResponseAsync` returns the verified `RelayState` on the result (`relayState`) when the
+transaction carried one, alongside `profile` and `loggedOut`. When the request was issued without
+a `RelayState`, the property is absent. A login issued while `validateInResponseTo` is `"never"`
+records no transaction and gets no `RelayState` check, because nothing ties the response to a
+request in that mode.
+
+Because the transaction lives in the [cache provider](#cache-provider), it survives a process
+restart when that provider is shared and persistent, such as Redis or a database; the default
+in-memory provider keeps it only for the life of the process, as it does for every request ID.
+The record is stored as a JSON string under the request ID, with `createdAt`, `relayState`, and
+`callbackUrl`; logout requests still store the bare ISO timestamp they always have, and older
+bare-string records are still read.
+
 A signature shows that the IdP answered a request, not that whoever presents the response started
 it. Someone with an account at your IdP who gets it to answer a request carrying another user's
 pending ID receives a genuinely signed response, and presenting it retires that user's request. When
@@ -1091,6 +1124,12 @@ writes to the cache provider on every login. Leaving it unset logs a warning und
 With `InResponseTo` validation on, the generated request IDs have to be stored somewhere, and with
 `rejectReplayedAssertions` on, so do the IDs of the assertions received. That is the
 `cacheProvider`'s job.
+
+The value under a login request's ID is the frozen login transaction — a JSON string holding
+`createdAt`, `relayState`, and `callbackUrl`, as described under
+[InResponseTo validation](#login-transactions-and-relaystate). A logout request's ID still stores
+the bare ISO timestamp, and assertion IDs are stored under separate keys. The interface is
+unchanged: every value is a string, so an existing provider keeps working without changes.
 
 The default is an `InMemoryCacheProvider`, which keeps request IDs in one process's memory. It is
 not sufficient across multiple servers or processes: the instance that generated the request ID may
